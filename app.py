@@ -254,102 +254,240 @@ def scrape_property_finder(url: str) -> dict:
 
 # ===================== MATCHING =====================
 
-def find_units(conn, prop: dict) -> list:
-    terms = []
+def extract_search_phrases(prop: dict) -> list:
+    """
+    Extract meaningful search phrases from scraped data.
+    Returns list of phrases ordered by specificity (most specific first).
+    
+    URL pattern: {type}-for-{sale/rent}-dubai-{location parts}-{id}
+    Location parts often follow: {master_project}-{project_name}
+    Example: "the-valley-farm-gardens" → ["farm gardens", "the valley", "the valley farm gardens"]
+    """
+    phrases = []
+    
+    # 1. Title/name from page (most reliable if available)
+    title = prop.get("title") or prop.get("og_title") or prop.get("name", "")
+    if title:
+        stop = {"for","sale","rent","in","at","a","an","bed","bedroom","bedrooms",
+                "bathroom","bathrooms","with","and","buy","aed","sqft","sq","ft",
+                "br","-","of","on","by","to","from","dubai","uae","property",
+                "villa","apartment","townhouse","penthouse","duplex","studio",
+                "residential","commercial"}
+        words = [w for w in re.split(r"[\s,\-/|]+", title) if w.lower() not in stop and len(w) > 1]
+        if words:
+            phrases.append(" ".join(words))
+    
+    # 2. URL location (always available)
     url_loc = prop.get("url_location", "")
     if url_loc:
-        terms.extend(url_loc.split())
-
-    title = prop.get("title") or prop.get("og_title") or prop.get("name", "")
-    stop = {"for","sale","rent","in","at","the","a","an","bed","bedroom","bedrooms",
-            "bathroom","bathrooms","with","and","buy","aed","sqft","sq","ft","dubai",
-            "br","-","of","on","by","to","from"}
-    if title:
-        terms.extend([w.lower() for w in re.split(r"[\s,\-/|]+", title) if w.lower() not in stop and len(w) > 2])
+        # Full phrase
+        phrases.append(url_loc)
+        
+        # Split into potential project + master_project combinations
+        # Try every split point: left part = master_project, right part = project_name
+        parts = url_loc.split()
+        if len(parts) >= 2:
+            for split_at in range(1, len(parts)):
+                left = " ".join(parts[:split_at])    # potential master project
+                right = " ".join(parts[split_at:])   # potential project name
+                if len(right) > 2:
+                    phrases.append(right)
+                if len(left) > 2:
+                    phrases.append(left)
+    
+    # 3. Breadcrumbs
     for crumb in prop.get("breadcrumbs", []):
-        terms.extend([w.lower() for w in crumb.split() if len(w) > 2])
-
+        c = crumb.strip()
+        if c.lower() not in ("dubai", "home", "buy", "rent", "properties", "uae") and len(c) > 2:
+            phrases.append(c)
+    
+    # 4. Address
+    addr = prop.get("address", "")
+    if addr and len(addr) > 3:
+        phrases.append(addr)
+    
+    area = prop.get("area", "")
+    if area and len(area) > 3:
+        phrases.append(area)
+    
+    # Deduplicate while preserving order
     seen = set()
     unique = []
-    for t in terms:
-        t = t.strip().lower()
-        if t and t not in seen and len(t) > 2:
-            seen.add(t)
-            unique.append(t)
-    if not unique:
+    for p in phrases:
+        p_lower = p.strip().lower()
+        if p_lower and p_lower not in seen:
+            seen.add(p_lower)
+            unique.append(p_lower)
+    
+    return unique
+
+
+def find_units(conn, prop: dict) -> list:
+    """
+    Multi-strategy search:
+    1. Exact project_name match (best)
+    2. Combined project + master_project match
+    3. Master project match filtered by property type
+    4. Area name fallback
+    """
+    phrases = extract_search_phrases(prop)
+    if not phrases:
         return []
-
+    
     results = []
-
-    # Strategy 1: project_name_en
-    for length in range(min(4, len(unique)), 0, -1):
-        for i in range(len(unique) - length + 1):
-            candidate = " ".join(unique[i:i + length])
-            rows = conn.execute('SELECT * FROM units WHERE LOWER(project_name_en) LIKE ? LIMIT 50', (f"%{candidate}%",)).fetchall()
-            if rows:
-                results.extend(rows)
-                break
-        if results:
+    
+    # === STRATEGY 1: Direct project_name_en match ===
+    # Try each phrase against project_name_en (most specific wins)
+    for phrase in phrases:
+        rows = conn.execute(
+            'SELECT * FROM units WHERE LOWER(project_name_en) LIKE ? LIMIT 100',
+            (f"%{phrase}%",)
+        ).fetchall()
+        if rows:
+            results.extend(rows)
             break
-
-    # Strategy 2: master_project_en
+    
+    # === STRATEGY 2: Combined project + master search ===
+    # Split URL location into all possible (master, project) pairs
     if not results:
-        for length in range(min(3, len(unique)), 0, -1):
-            for i in range(len(unique) - length + 1):
-                candidate = " ".join(unique[i:i + length])
-                rows = conn.execute('SELECT * FROM units WHERE LOWER(master_project_en) LIKE ? LIMIT 100', (f"%{candidate}%",)).fetchall()
+        url_loc = prop.get("url_location", "")
+        if url_loc:
+            parts = url_loc.split()
+            for split_at in range(1, len(parts)):
+                master_candidate = " ".join(parts[:split_at])
+                project_candidate = " ".join(parts[split_at:])
+                if len(project_candidate) > 2 and len(master_candidate) > 2:
+                    rows = conn.execute(
+                        '''SELECT * FROM units 
+                           WHERE LOWER(project_name_en) LIKE ? 
+                             AND LOWER(master_project_en) LIKE ?
+                           LIMIT 100''',
+                        (f"%{project_candidate}%", f"%{master_candidate}%")
+                    ).fetchall()
+                    if rows:
+                        results.extend(rows)
+                        break
+    
+    # === STRATEGY 3: master_project_en match ===
+    if not results:
+        for phrase in phrases:
+            if len(phrase) > 3:  # Skip very short phrases
+                rows = conn.execute(
+                    'SELECT * FROM units WHERE LOWER(master_project_en) LIKE ? LIMIT 200',
+                    (f"%{phrase}%",)
+                ).fetchall()
+                if rows:
+                    results.extend(rows)
+                    break
+    
+    # === STRATEGY 4: area_name_en match ===
+    if not results:
+        for phrase in phrases:
+            if len(phrase) > 3:
+                rows = conn.execute(
+                    'SELECT * FROM units WHERE LOWER(area_name_en) LIKE ? LIMIT 200',
+                    (f"%{phrase}%",)
+                ).fetchall()
+                if rows:
+                    results.extend(rows)
+                    break
+    
+    # === STRATEGY 5: Individual significant words (last resort) ===
+    if not results:
+        noise = {"the","and","for","villa","apartment","tower","building","residence",
+                 "residences","dubai","phase","block","cluster"}
+        for phrase in phrases:
+            words = [w for w in phrase.split() if w not in noise and len(w) > 3]
+            for word in words:
+                rows = conn.execute(
+                    'SELECT * FROM units WHERE LOWER(project_name_en) LIKE ? LIMIT 100',
+                    (f"%{word}%",)
+                ).fetchall()
                 if rows:
                     results.extend(rows)
                     break
             if results:
                 break
-
-    # Strategy 3: area_name_en
-    if not results:
-        for t in unique:
-            rows = conn.execute('SELECT * FROM units WHERE LOWER(area_name_en) LIKE ? LIMIT 100', (f"%{t}%",)).fetchall()
-            if rows:
-                results.extend(rows)
-                break
-
-    return rank_results(results, prop, unique)[:20]
+    
+    return rank_results(results, prop, phrases)[:20]
 
 
-def rank_results(rows, prop, search_terms):
+def rank_results(rows, prop, search_phrases):
+    """Score and rank results. Higher = better match."""
     scored = []
-    search_str = " ".join(search_terms).lower()
+    
+    # Build all search terms for comparison
+    all_terms = set()
+    for p in search_phrases:
+        all_terms.update(p.lower().split())
+    all_terms -= {"the","and","for","of","in","at","a","an","to","by","on","from"}
+    
+    full_search = " ".join(search_phrases).lower()
+    
     for row in rows:
         d = dict(row)
         score = 0
+        
         project = (d.get("project_name_en") or "").lower()
-        if project:
-            score += SequenceMatcher(None, search_str, project).ratio() * 50
-        area = (d.get("area_name_en") or "").lower()
-        for t in search_terms:
-            if t in area: score += 10
         master = (d.get("master_project_en") or "").lower()
-        for t in search_terms:
-            if t in master: score += 15
+        area = (d.get("area_name_en") or "").lower()
+        
+        # Exact phrase match in project name (strongest signal)
+        for phrase in search_phrases:
+            if phrase in project:
+                score += 60 * (len(phrase.split()) / max(len(search_phrases[0].split()), 1))
+        
+        # Project name similarity
+        if project:
+            score += SequenceMatcher(None, full_search, project).ratio() * 30
+        
+        # Master project match
+        for phrase in search_phrases:
+            if phrase in master:
+                score += 25 * (len(phrase.split()) / max(len(search_phrases[0].split()), 1))
+        
+        # Area match
+        for term in all_terms:
+            if term in area:
+                score += 5
+        
+        # Property type match
         ptype = prop.get("property_type", "").lower()
         db_type = (d.get("property_type_en") or "").lower()
-        if ptype and ptype in db_type: score += 10
+        db_subtype = (d.get("property_sub_type_en") or "").lower()
+        if ptype:
+            if ptype in db_type or ptype in db_subtype:
+                score += 15
+            elif ptype == "villa" and "villa" in db_subtype:
+                score += 15
+        
+        # Bedroom match
         beds = prop.get("bedrooms")
         db_rooms = d.get("rooms")
         if beds is not None and db_rooms:
             try:
-                if int(beds) == int(float(db_rooms)): score += 5
-            except: pass
+                if int(beds) == int(float(db_rooms)):
+                    score += 10
+            except:
+                pass
+        
+        # Area size match (within 15%)
         sqft = prop.get("area_sqft")
         db_area = d.get("actual_area")
         if sqft and db_area:
             try:
                 db_sqft = float(db_area) * 10.764
-                if abs(sqft - db_sqft) < sqft * 0.15: score += 8
-            except: pass
-        d["_match_score"] = score
+                if abs(sqft - db_sqft) < sqft * 0.15:
+                    score += 12
+            except:
+                pass
+        
+        d["_match_score"] = round(score, 1)
         scored.append(d)
-
+    
     scored.sort(key=lambda x: x["_match_score"], reverse=True)
+    
+    # Deduplicate
     seen = set()
     unique = []
     for d in scored:
@@ -357,6 +495,7 @@ def rank_results(rows, prop, search_terms):
         if key not in seen:
             seen.add(key)
             unique.append(d)
+    
     return unique
 
 
@@ -402,8 +541,8 @@ DISPLAY_FIELDS = [
 
 def render_card(match, i):
     score = match.get("_match_score", 0)
-    if score > 40: badge = '<span class="match-score match-high">High Match</span>'
-    elif score > 20: badge = '<span class="match-score match-medium">Medium Match</span>'
+    if score > 50: badge = '<span class="match-score match-high">High Match</span>'
+    elif score > 25: badge = '<span class="match-score match-medium">Medium Match</span>'
     else: badge = '<span class="match-score match-low">Low Match</span>'
 
     project = match.get("project_name_en") or match.get("project_name_ar") or "Unknown"
@@ -490,6 +629,11 @@ def main():
                 "Location": prop.get("url_location", "—"),
             }.items():
                 st.markdown(f"**{k}:** {v}")
+            
+            # Show search phrases for transparency
+            phrases = extract_search_phrases(prop)
+            if phrases:
+                st.markdown(f"**Search phrases:** {', '.join([f'`{p}`' for p in phrases[:8]])}")
 
         with st.spinner("🔍 Searching DLD..."):
             matches = find_units(conn, prop)
