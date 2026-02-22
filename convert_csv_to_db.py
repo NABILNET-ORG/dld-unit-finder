@@ -146,15 +146,10 @@ def convert_csv_to_sqlite(csv_path, db_path=DB_PATH):
     cursor = conn.cursor()
 
     # --- Create table with ALL columns as TEXT (preserves everything exactly) ---
-    pk_col = "property_id" if "property_id" in unique_columns else None
-
-    col_defs = []
-    for col in unique_columns:
-        if col == pk_col:
-            col_defs.append(f'"{col}" TEXT PRIMARY KEY')
-        else:
-            col_defs.append(f'"{col}" TEXT')
-
+    # NO PRIMARY KEY on any column! The CSV has duplicate property_ids
+    # (~1.1M duplicates). Using a PK + INSERT OR REPLACE would silently
+    # drop those rows. We use SQLite's implicit rowid instead.
+    col_defs = [f'"{col}" TEXT' for col in unique_columns]
     create_sql = f'CREATE TABLE units (\n  {", ".join(col_defs)}\n)'
     cursor.execute(create_sql)
 
@@ -166,7 +161,7 @@ def convert_csv_to_sqlite(csv_path, db_path=DB_PATH):
 
     placeholders = ", ".join(["?" for _ in unique_columns])
     col_list = ", ".join([f'"{c}"' for c in unique_columns])
-    insert_sql = f"INSERT OR REPLACE INTO units ({col_list}) VALUES ({placeholders})"
+    insert_sql = f"INSERT INTO units ({col_list}) VALUES ({placeholders})"
 
     csv.field_size_limit(sys.maxsize)
 
@@ -367,20 +362,39 @@ def upload_to_gdrive(db_path, folder_id=None):
         print("   ❌ Install: pip install google-auth google-api-python-client")
         return None
 
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
     creds_file = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json")
 
-    if creds_json:
-        creds = Credentials.from_service_account_info(
-            json.loads(creds_json),
-            scopes=["https://www.googleapis.com/auth/drive.file"],
-        )
+    if creds_json and creds_json.startswith("{"):
+        try:
+            creds_data = json.loads(creds_json)
+            creds = Credentials.from_service_account_info(
+                creds_data,
+                scopes=["https://www.googleapis.com/auth/drive.file"],
+            )
+            print("   🔑 Using credentials from GOOGLE_CREDENTIALS_JSON env var")
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"   ❌ GOOGLE_CREDENTIALS_JSON is not valid JSON!")
+            print(f"      Error: {e}")
+            print(f"      First 50 chars: {repr(creds_json[:50])}")
+            print(f"      Length: {len(creds_json)} chars")
+            print()
+            print("   💡 FIX: Go to GitHub → Settings → Secrets → GOOGLE_CREDENTIALS_JSON")
+            print("      Open the JSON file in Notepad, select ALL (Ctrl+A), copy (Ctrl+C)")
+            print("      Paste the ENTIRE file content (from { to }) as the secret value")
+            return None
     elif os.path.exists(creds_file):
         creds = Credentials.from_service_account_file(
             creds_file, scopes=["https://www.googleapis.com/auth/drive.file"]
         )
+        print(f"   🔑 Using credentials from {creds_file}")
     else:
         print(f"   ❌ No credentials found!")
+        print(f"      GOOGLE_CREDENTIALS_JSON env var: {'set but empty/invalid' if creds_json else 'not set'}")
+        print(f"      Service account file ({creds_file}): not found")
+        print()
+        print("   💡 FIX: Add GOOGLE_CREDENTIALS_JSON as a GitHub secret")
+        print("      (see SETUP_GUIDE.md Step 3.3)")
         return None
 
     service = build("drive", "v3", credentials=creds)
