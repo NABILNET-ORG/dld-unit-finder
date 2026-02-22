@@ -1,82 +1,143 @@
 # 🏠 DLD Unit Finder
 
-**Property Finder Link → Unit Number & Full DLD Data** | مجاني 100%
+**Property Finder URL → Unit Number & Full DLD Data** | 100% Free
 
-تطبيق ويب بيجيب رقم الوحدة وكل بيانات دائرة الأراضي والأملاك بدبي من لينك Property Finder.
-
----
-
-## ✨ Features / الميزات
-
-- 🔗 **حطّ لينك Property Finder** → بيطلعلك الـ Unit Number + كل الداتا
-- 📊 **46 عمود من DLD** — كلها محفوظة، ولا معلومة بتروح (zero data loss)
-- 🔄 **كبسة Update Now** بالـ sidebar — تحديث يدوي بأي وقت
-- ⏰ **تحديث تلقائي كل أسبوع** عبر GitHub Actions
-- 📱 **بيشتغل على أي جهاز** — موبايل، تابلت، لابتوب
-- 🆓 **مجاني 100%** — ولا سنت
+A web app that extracts unit numbers and full property registration data from Dubai Land Department by matching Property Finder listing URLs against DLD's open dataset of 2.3M+ freehold units.
 
 ---
 
-## 🏗️ Architecture / البنية التقنية
+## Features
+
+- Paste a Property Finder link → get unit number, land number, zone, and all registration data
+- All 46 DLD columns preserved with zero data loss
+- Manual "Update Now" button in sidebar for on-demand refresh
+- Auto-updates weekly via GitHub Actions
+- Works on any device (mobile, tablet, desktop)
+- Completely free — no paid APIs, no subscriptions
+
+## Architecture
 
 ```
 ┌─────────────────┐     ┌──────────────┐     ┌─────────────┐
 │  Streamlit App   │────▶│ Property     │     │ Dubai Pulse  │
-│  (FREE)          │     │ Finder       │     │ (DLD Open    │
-│                  │     │ Scraping     │     │  Data - CSV) │
+│  (Streamlit      │     │ Finder       │     │ (DLD Open    │
+│   Cloud - FREE)  │     │ Scraping     │     │  Data - CSV) │
 └────────┬─────────┘     └──────────────┘     └──────┬──────┘
          │                                           │
-         │  reads SQLite                    weekly    │
-         │  + manual update btn             download  │
+         │  downloads                       weekly   │
+         │  compressed DB                   download  │
     ┌────▼────────┐                          ┌───────▼───────┐
-    │ Google Drive │◀─────────────────────────│ GitHub Actions│
-    │ (SQLite DB)  │     auto-upload          │ (FREE cron)   │
+    │   GitHub     │◀─────────────────────────│ GitHub Actions│
+    │   Releases   │     gzip + upload        │ (FREE cron)   │
     └──────────────┘                          └───────────────┘
 ```
 
-## 📊 Data Integrity / سلامة البيانات
+## How It Works
 
-الـ converter بيحافظ على **كل** البيانات:
+1. You paste a Property Finder listing URL
+2. The app scrapes property details (project name, area, bedrooms, size)
+3. It searches the DLD SQLite database using fuzzy matching
+4. Returns matching units with all 46 columns of registration data
+
+## Data Integrity
 
 | Aspect | Detail |
 |--------|--------|
-| Columns | **All 46** columns from DLD CSV (dynamically detected) |
-| Storage | All values stored as TEXT — no type casting = no data loss |
-| Verification | Automatic row/column count verification after conversion |
-| Metadata | JSON metadata file with full audit trail |
+| Columns | All 46 from DLD CSV (dynamically detected) |
+| Rows | 2,376,922 freehold units |
+| Storage | All values stored as TEXT — no type casting, no data loss |
+| Verification | Automatic row/column count check after every conversion |
 | Indexes | 17 indexes for fast search |
+| Compression | ~1.3GB DB → ~200MB gzip for transfer |
 
-البيانات يلّي بتنحفظ تشمل:
-`unit_number`, `land_number`, `land_sub_number`, `building_number`, `floor`, `rooms`, `actual_area`, `common_area`, `actual_common_area`, `unit_balcony_area`, `unit_parking_number`, `parking_allocation_type`, `property_type`, `property_sub_type`, `project_name` (EN+AR), `master_project` (EN+AR), `area_name` (EN+AR), `zone_id`, `area_id`, `property_id`, `parent_property_id`, `grandparent_property_id`, `is_free_hold`, `is_lease_hold`, `is_registered`, `pre_registration_number`, `munc_number`, `munc_zip_code`, `parcel_id`, `land_type`, `creation_date`, etc.
+## Quick Start
 
----
+### Prerequisites
 
-## 📋 Setup Guide / دليل التركيب
+- GitHub account
+- Streamlit Cloud account (free): https://share.streamlit.io
 
-### Step 1: Google Cloud Service Account (مرة وحدة بس)
+### Setup
 
-1. روح على [Google Cloud Console](https://console.cloud.google.com/)
-2. أنشئ مشروع جديد (أو استخدم موجود)
-3. فعّل **Google Drive API**:
-   - Navigation Menu → APIs & Services → Library
-   - ابحث عن "Google Drive API" → Enable
-4. أنشئ Service Account:
-   - APIs & Services → Credentials → Create Credentials → Service Account
-   - سمّيه `dld-updater`
-   - Keys → Add Key → JSON → Download
-5. أنشئ مجلد على Google Drive اسمه `DLD-Data`
-6. شارك المجلد مع الـ service account email (موجود بالـ JSON)
-   - مثلاً: `dld-updater@project-id.iam.gserviceaccount.com`
-   - صلاحية **Editor**
-7. انسخ الـ **Folder ID** من URL المجلد
+1. **Fork or clone** this repository
+2. Go to **Actions** tab → **Weekly DLD Data Update** → **Run workflow**
+3. Wait 15–25 minutes for the database to build and upload as a Release
+4. If repo is private, create a [Fine-grained token](https://github.com/settings/tokens?type=beta) with **Contents: Read-only** access
+5. Deploy on **Streamlit Cloud**:
+   - Repository: `your-username/dld-unit-finder`
+   - Branch: `main`
+   - Main file: `app.py`
+   - Secrets:
+     ```toml
+     GITHUB_REPO = "your-username/dld-unit-finder"
+     GITHUB_TOKEN = "github_pat_xxxxx"  # only for private repos
+     ```
+6. Done. The app auto-updates weekly.
 
-### Step 2: GitHub Repository
+See [SETUP_GUIDE.md](SETUP_GUIDE.md) for detailed step-by-step instructions.
+
+## Local Development
 
 ```bash
-git init
-git add .
-git commit -m "Initial commit"
-git remote add origin https://github.com/YOUR_USERNAME/dld-unit-finder.git
+pip install -r requirements.txt
+
+# Download and convert (first time)
+python convert_csv_to_db.py
+
+# Verify data integrity
+python convert_csv_to_db.py --verify
+
+# Use a local CSV
+python convert_csv_to_db.py --csv /path/to/units.csv
+
+# Run the app
+streamlit run app.py
+```
+
+## Cost
+
+| Service | Cost |
+|---------|------|
+| Dubai Pulse Data | Free |
+| GitHub Actions | Free (2,000 min/month) |
+| GitHub Releases | Free (included storage) |
+| Streamlit Cloud | Free (Community plan) |
+| **Total** | **$0/month** |
+
+## Project Structure
+
+```
+dld-unit-finder/
+├── app.py                              # Streamlit web app
+├── convert_csv_to_db.py                # CSV → SQLite converter (zero data loss)
+├── requirements.txt                    # Python dependencies
+├── README.md
+├── SETUP_GUIDE.md                      # Detailed setup instructions
+├── .gitignore
+├── .streamlit/
+│   ├── config.toml                     # Streamlit theme
+│   └── secrets.toml.example            # Secrets template
+└── .github/
+    └── workflows/
+        └── update_data.yml             # Weekly auto-update via GitHub Actions
+```
+
+## Data Source
+
+- **Dubai Land Department** via [Dubai Pulse](https://www.dubaipulse.gov.ae/data/dld-registration/dld_units-open) (Open Data)
+- Dataset: `dld_units-open` — all freehold units registered with DLD
+- Updated daily by DLD, pulled weekly by this tool
+- 46 columns including: unit number, land number, building, project, area, zone, property type, rooms, floor, parking, freehold/leasehold status, registration info, and more
+
+## Limitations
+
+1. **Owner information** (name, phone) is not included in the open dataset — it is protected by law
+2. **Off-plan properties** may not yet be registered in DLD
+3. **Matching accuracy** depends on project naming consistency between Property Finder and DLD records
+
+## License
+
+For personal use only. Uses publicly available government open data.
 git push -u origin main
 ```
 
