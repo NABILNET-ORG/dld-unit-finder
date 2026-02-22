@@ -175,42 +175,45 @@ def get_db_stats():
 # ===================== SCRAPER =====================
 
 def scrape_property_finder(url: str) -> dict:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    """
+    Scrape Property Finder listing page.
+    Uses a session with full browser headers to avoid blocks.
+    Extracts: title, bedrooms, area, location, zone name, breadcrumbs, etc.
+    """
+    
+    # Full browser-like headers — this is key to avoid blocks
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-    }
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+        "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "DNT": "1",
+        "Referer": "https://www.google.com/",
+    })
+
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = session.get(url, timeout=20, allow_redirects=True)
         resp.raise_for_status()
     except requests.RequestException as e:
         return {"error": f"Failed to fetch: {e}"}
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    data = {"source_url": url}
+    html = resp.text
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    data = {"source_url": url, "_html_length": len(html)}
 
-    # JSON-LD
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            ld = json.loads(script.string)
-            items = ld if isinstance(ld, list) else [ld]
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                if "name" in item:
-                    data["name"] = item["name"]
-                if "address" in item and isinstance(item["address"], dict):
-                    data["address"] = item["address"].get("streetAddress", "")
-                    data["area"] = item["address"].get("addressLocality", "")
-                if "numberOfRooms" in item:
-                    data["bedrooms"] = int(item["numberOfRooms"])
-                if "floorSize" in item and isinstance(item["floorSize"], dict):
-                    val = item["floorSize"].get("value")
-                    if val:
-                        data["area_sqft"] = float(str(val).replace(",", ""))
-        except:
-            continue
-
-    # URL parsing
+    # === 1. URL parsing (always works) ===
     slug = url.rstrip("/").split("/")[-1].replace(".html", "")
     parts = slug.split("-")
     for pt in ["villa", "apartment", "townhouse", "penthouse", "duplex", "studio"]:
@@ -225,29 +228,113 @@ def scrape_property_finder(url: str) -> dict:
         if loc:
             data["url_location"] = " ".join(loc)
 
-    # Page elements
+    # === 2. Page title / og:title ===
+    title_tag = soup.find("title")
+    if title_tag and title_tag.string:
+        raw_title = title_tag.string.strip()
+        # Remove " | Property Finder" suffix
+        raw_title = re.sub(r"\s*\|\s*Property Finder.*$", "", raw_title)
+        data["page_title"] = raw_title
+
+    for meta in soup.find_all("meta"):
+        content = meta.get("content", "").strip()
+        prop_name = (meta.get("name") or meta.get("property") or "").lower()
+        if "og:title" in prop_name and content:
+            data["og_title"] = re.sub(r"\s*\|\s*Property Finder.*$", "", content)
+
+    # === 3. H1 title ===
     h1 = soup.find("h1")
     if h1:
         data["title"] = h1.get_text(strip=True)
-    for meta in soup.find_all("meta"):
-        content = meta.get("content", "")
-        name = (meta.get("name") or meta.get("property") or "").lower()
-        if "og:title" in name and content:
-            data["og_title"] = content
-    crumbs = soup.select("[class*='readcrumb'] a, [class*='Breadcrumb'] a, nav[aria-label='breadcrumb'] a")
-    texts = [b.get_text(strip=True) for b in crumbs if b.get_text(strip=True)]
-    if texts:
-        data["breadcrumbs"] = texts
 
-    text = soup.get_text()
+    # === 4. Breadcrumbs ===
+    # Try multiple selectors for breadcrumbs
+    crumb_links = soup.select("ol li a, nav a, [aria-label*='breadcrumb'] a")
+    crumb_texts = []
+    for link in crumb_links:
+        href = link.get("href", "")
+        txt = link.get_text(strip=True)
+        # PF breadcrumbs link to sale/rent category pages
+        if txt and ("for-sale" in href or "for-rent" in href) and len(txt) > 2:
+            crumb_texts.append(txt)
+    if crumb_texts:
+        data["breadcrumbs"] = crumb_texts
+
+    # Also look at the URL-based breadcrumb pattern from PF
+    # e.g., "Villas for sale in Dubai > The Valley > Farm Gardens > Farm Gardens 1"
+    for link in soup.find_all("a"):
+        txt = link.get_text(strip=True)
+        href = link.get("href", "")
+        if "villas-for-sale-the-valley" in href or "for-sale-the-valley" in href:
+            if txt and txt not in crumb_texts:
+                crumb_texts.append(txt)
+
+    # === 5. JSON-LD structured data ===
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            ld = json.loads(script.string)
+            items = ld if isinstance(ld, list) else [ld]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if "name" in item and not data.get("title"):
+                    data["name"] = item["name"]
+                if "address" in item and isinstance(item["address"], dict):
+                    data["address"] = item["address"].get("streetAddress", "")
+                    data["area"] = item["address"].get("addressLocality", "")
+                if "numberOfRooms" in item:
+                    data["bedrooms"] = int(item["numberOfRooms"])
+                if "floorSize" in item and isinstance(item["floorSize"], dict):
+                    val = item["floorSize"].get("value")
+                    if val:
+                        data["area_sqft"] = float(str(val).replace(",", ""))
+        except:
+            continue
+
+    # === 6. Extract from page text (regex fallback) ===
     if "bedrooms" not in data:
-        m = re.search(r"(\d+)\s*(?:bed(?:room)?s?|BR)", text, re.I)
+        m = re.search(r"(\d+)\s*(?:Bed(?:room)?s?|BR)\b", text, re.I)
         if m:
             data["bedrooms"] = int(m.group(1))
+    
     if "area_sqft" not in data:
-        m = re.search(r"([\d,]+(?:\.\d+)?)\s*(?:sq\.?\s*ft|sqft)", text, re.I)
+        m = re.search(r"([\d,]+(?:\.\d+)?)\s*sqft\b", text, re.I)
+        if not m:
+            m = re.search(r"([\d,]+(?:\.\d+)?)\s*sq\.?\s*ft\b", text, re.I)
         if m:
             data["area_sqft"] = float(m.group(1).replace(",", ""))
+
+    # === 7. Zone name (from regulatory info — maps to DLD area_name!) ===
+    zone_match = re.search(r"Zone\s*name\s*[:\s]*([A-Za-z][A-Za-z\s\d]+)", text)
+    if zone_match:
+        data["dld_zone_name"] = zone_match.group(1).strip()
+    
+    # Also look for DLD permit number and reference
+    ref_match = re.search(r"Reference\s*[:\s]*([A-Za-z0-9\-]+)", text)
+    if ref_match:
+        data["reference"] = ref_match.group(1).strip()
+
+    # === 8. Location from the address line on page ===
+    # Pattern: "Farm Gardens 1, Farm Gardens, The Valley, Dubai"
+    addr_match = re.search(r"([\w\s]+(?:,\s*[\w\s]+){2,3},\s*Dubai)", text)
+    if addr_match:
+        data["full_address"] = addr_match.group(1).strip()
+        # Parse components
+        addr_parts = [p.strip() for p in addr_match.group(1).split(",")]
+        if len(addr_parts) >= 3:
+            data["sub_community"] = addr_parts[0]  # Farm Gardens 1
+            data["community"] = addr_parts[1]       # Farm Gardens
+            data["master_community"] = addr_parts[2] # The Valley
+
+    # === 9. Property details from page ===
+    if "bedrooms" not in data:
+        bed_m = re.search(r"Bedrooms?\s*(\d+)", text, re.I)
+        if bed_m:
+            data["bedrooms"] = int(bed_m.group(1))
+
+    bath_m = re.search(r"Bathrooms?\s*(\d+)", text, re.I)
+    if bath_m:
+        data["bathrooms"] = int(bath_m.group(1))
 
     return data
 
@@ -258,59 +345,59 @@ def extract_search_phrases(prop: dict) -> list:
     """
     Extract meaningful search phrases from scraped data.
     Returns list of phrases ordered by specificity (most specific first).
-    
-    URL pattern: {type}-for-{sale/rent}-dubai-{location parts}-{id}
-    Location parts often follow: {master_project}-{project_name}
-    Example: "the-valley-farm-gardens" → ["farm gardens", "the valley", "the valley farm gardens"]
     """
     phrases = []
     
-    # 1. Title/name from page (most reliable if available)
+    # 1. Sub-community / community / master from page address (MOST SPECIFIC)
+    # e.g., "Farm Gardens 1" / "Farm Gardens" / "The Valley"
+    sub = prop.get("sub_community", "")
+    comm = prop.get("community", "")
+    master = prop.get("master_community", "")
+    if sub:
+        phrases.append(sub)
+    if comm and comm != sub:
+        phrases.append(comm)
+    if master and master != comm:
+        phrases.append(master)
+    
+    # 2. DLD Zone name (from regulatory info — maps to DLD area_name!)
+    zone = prop.get("dld_zone_name", "")
+    if zone:
+        phrases.append(zone)
+    
+    # 3. Title/name from page
     title = prop.get("title") or prop.get("og_title") or prop.get("name", "")
     if title:
         stop = {"for","sale","rent","in","at","a","an","bed","bedroom","bedrooms",
                 "bathroom","bathrooms","with","and","buy","aed","sqft","sq","ft",
                 "br","-","of","on","by","to","from","dubai","uae","property",
-                "villa","apartment","townhouse","penthouse","duplex","studio",
-                "residential","commercial"}
+                "elegant","luxury","luxurious","beautiful","stunning","spacious",
+                "brand","new","modern","exclusive","premium","amazing","gorgeous"}
         words = [w for w in re.split(r"[\s,\-/|]+", title) if w.lower() not in stop and len(w) > 1]
         if words:
             phrases.append(" ".join(words))
     
-    # 2. URL location (always available)
+    # 4. URL location
     url_loc = prop.get("url_location", "")
     if url_loc:
-        # Full phrase
         phrases.append(url_loc)
-        
-        # Split into potential project + master_project combinations
-        # Try every split point: left part = master_project, right part = project_name
         parts = url_loc.split()
         if len(parts) >= 2:
             for split_at in range(1, len(parts)):
-                left = " ".join(parts[:split_at])    # potential master project
-                right = " ".join(parts[split_at:])   # potential project name
+                left = " ".join(parts[:split_at])
+                right = " ".join(parts[split_at:])
                 if len(right) > 2:
                     phrases.append(right)
                 if len(left) > 2:
                     phrases.append(left)
     
-    # 3. Breadcrumbs
+    # 5. Breadcrumbs
     for crumb in prop.get("breadcrumbs", []):
         c = crumb.strip()
         if c.lower() not in ("dubai", "home", "buy", "rent", "properties", "uae") and len(c) > 2:
             phrases.append(c)
     
-    # 4. Address
-    addr = prop.get("address", "")
-    if addr and len(addr) > 3:
-        phrases.append(addr)
-    
-    area = prop.get("area", "")
-    if area and len(area) > 3:
-        phrases.append(area)
-    
-    # Deduplicate while preserving order
+    # Deduplicate
     seen = set()
     unique = []
     for p in phrases:
@@ -325,16 +412,47 @@ def extract_search_phrases(prop: dict) -> list:
 def find_units(conn, prop: dict) -> list:
     """
     Multi-strategy search:
-    1. Exact project_name match (best)
+    0. DLD Zone name → area_name_en (most accurate if available)
+    1. Exact project_name match
     2. Combined project + master_project match
-    3. Master project match filtered by property type
+    3. Master project match
     4. Area name fallback
+    5. Individual words (last resort)
     """
     phrases = extract_search_phrases(prop)
     if not phrases:
         return []
     
     results = []
+    
+    # === STRATEGY 0: DLD Zone name → area_name_en (BEST — from regulatory info) ===
+    zone = prop.get("dld_zone_name", "")
+    community = prop.get("community") or prop.get("sub_community", "")
+    if zone and community:
+        # Search project within the DLD zone
+        rows = conn.execute(
+            '''SELECT * FROM units 
+               WHERE LOWER(area_name_en) LIKE ? 
+                 AND LOWER(project_name_en) LIKE ?
+               LIMIT 200''',
+            (f"%{zone.lower()}%", f"%{community.lower()}%")
+        ).fetchall()
+        if rows:
+            results.extend(rows)
+    
+    if not results and zone:
+        # Try zone + master community
+        master = prop.get("master_community", "")
+        if master:
+            rows = conn.execute(
+                '''SELECT * FROM units 
+                   WHERE LOWER(area_name_en) LIKE ? 
+                     AND LOWER(master_project_en) LIKE ?
+                   LIMIT 200''',
+                (f"%{zone.lower()}%", f"%{master.lower()}%")
+            ).fetchall()
+            if rows:
+                results.extend(rows)
     
     # === STRATEGY 1: Direct project_name_en match ===
     # Try each phrase against project_name_en (most specific wins)
@@ -423,6 +541,7 @@ def rank_results(rows, prop, search_phrases):
     all_terms -= {"the","and","for","of","in","at","a","an","to","by","on","from"}
     
     full_search = " ".join(search_phrases).lower()
+    zone = prop.get("dld_zone_name", "").lower() if prop else ""
     
     for row in rows:
         d = dict(row)
@@ -450,6 +569,10 @@ def rank_results(rows, prop, search_phrases):
         for term in all_terms:
             if term in area:
                 score += 5
+        
+        # DLD Zone name match (strong signal)
+        if zone and zone in area:
+            score += 20
         
         # Property type match
         ptype = prop.get("property_type", "").lower()
@@ -625,12 +748,17 @@ def main():
                 "Title": prop.get("title") or prop.get("og_title") or prop.get("name", "—"),
                 "Type": prop.get("property_type", "—"),
                 "Bedrooms": prop.get("bedrooms", "—"),
+                "Bathrooms": prop.get("bathrooms", "—"),
                 "Area (sqft)": prop.get("area_sqft", "—"),
-                "Location": prop.get("url_location", "—"),
+                "Address": prop.get("full_address") or prop.get("url_location", "—"),
+                "Community": prop.get("community", "—"),
+                "Master Community": prop.get("master_community", "—"),
+                "DLD Zone Name": prop.get("dld_zone_name", "—"),
+                "Reference": prop.get("reference", "—"),
+                "HTML size": f"{prop.get('_html_length', 0):,} chars",
             }.items():
                 st.markdown(f"**{k}:** {v}")
             
-            # Show search phrases for transparency
             phrases = extract_search_phrases(prop)
             if phrases:
                 st.markdown(f"**Search phrases:** {', '.join([f'`{p}`' for p in phrases[:8]])}")
