@@ -1,0 +1,28 @@
+# Database files (stored on Google Drive, not in repo)
+*.db
+*.sqlite
+*.sqlite3
+
+# Raw CSV data
+units_raw.csv
+units.csv
+
+# Google credentials (NEVER commit these!)
+service_account.json
+*.json
+!package.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
