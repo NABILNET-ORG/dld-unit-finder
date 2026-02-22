@@ -1,1 +1,39 @@
+# .github/workflows/update_data.yml
+# Automatically downloads DLD data weekly and uploads to Google Drive
 
+name: Weekly DLD Data Update
+
+on:
+  schedule:
+    # Every Sunday at 3:00 AM UTC
+    - cron: '0 3 * * 0'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests google-auth google-api-python-client
+
+      - name: Download CSV and convert to SQLite
+        run: python convert_csv_to_db.py --upload
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+
+      - name: Log completion
+        run: |
+          echo "✅ Data update completed at $(date)"
+          echo "Database size: $(du -h dld_units.db | cut -f1)"
