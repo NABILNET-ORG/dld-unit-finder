@@ -1,5 +1,5 @@
 # .github/workflows/update_data.yml
-# Automatically downloads DLD data weekly and uploads to Google Drive
+# Downloads DLD data weekly, converts to SQLite, compresses, uploads as GitHub Release
 
 name: Weekly DLD Data Update
 
@@ -7,12 +7,15 @@ on:
   schedule:
     # Every Sunday at 3:00 AM UTC
     - cron: '0 3 * * 0'
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:  # Manual trigger button
+
+permissions:
+  contents: write  # Needed to create releases
 
 jobs:
   update-data:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -24,16 +27,50 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          pip install requests google-auth google-api-python-client
+        run: pip install requests
 
       - name: Download CSV and convert to SQLite
-        run: python convert_csv_to_db.py --upload
+        run: python convert_csv_to_db.py
+
+      - name: Compress database
+        run: |
+          echo "📦 Compressing database..."
+          ls -lh dld_units.db
+          gzip -9 -k dld_units.db
+          ls -lh dld_units.db.gz
+          echo "DB_SIZE=$(du -h dld_units.db | cut -f1)" >> $GITHUB_ENV
+          echo "GZ_SIZE=$(du -h dld_units.db.gz | cut -f1)" >> $GITHUB_ENV
+          echo "ROW_COUNT=$(python3 -c "import sqlite3; c=sqlite3.connect('dld_units.db'); print(c.execute('SELECT COUNT(*) FROM units').fetchone()[0])")" >> $GITHUB_ENV
+          echo "TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_ENV
+
+      - name: Delete old release (if exists)
+        run: |
+          gh release delete latest-data --yes --cleanup-tag || true
         env:
-          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create new release with database
+        run: |
+          gh release create latest-data \
+            dld_units.db.gz \
+            db_metadata.json \
+            --title "DLD Database - ${{ env.TIMESTAMP }}" \
+            --notes "🏠 **DLD Unit Database Auto-Update**
+
+          📊 **Stats:**
+          - Rows: ${{ env.ROW_COUNT }}
+          - Columns: 46 (all preserved)
+          - DB size: ${{ env.DB_SIZE }}
+          - Compressed: ${{ env.GZ_SIZE }}
+          - Updated: ${{ env.TIMESTAMP }}
+
+          📥 Download \`dld_units.db.gz\` and decompress with \`gunzip\`" \
+            --latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log completion
         run: |
           echo "✅ Data update completed at $(date)"
-          echo "Database size: $(du -h dld_units.db | cut -f1)"
+          echo "Database: ${{ env.DB_SIZE }} → ${{ env.GZ_SIZE }} compressed"
+          echo "Rows: ${{ env.ROW_COUNT }}"
