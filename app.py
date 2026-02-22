@@ -1,6 +1,6 @@
 """
 DLD Unit Finder — Property Finder Link → Unit Number
-Streamlit app with manual update button, Google Drive sync, and full DLD data.
+Downloads DB from GitHub Releases. Manual update button in sidebar.
 """
 
 import streamlit as st
@@ -11,154 +11,142 @@ import re
 import os
 import json
 import time
+import gzip
+import shutil
 from difflib import SequenceMatcher
 
 # --- Config ---
 DB_PATH = "dld_units.db"
-METADATA_PATH = "db_metadata.json"
-GDRIVE_FILE_ID = os.environ.get("GDRIVE_FILE_ID", "")
+DB_GZ_PATH = "dld_units.db.gz"
+
+# GitHub Release config — change these to your repo
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "NABILNET-ORG/dld-unit-finder")
+GITHUB_RELEASE_TAG = "latest-data"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")  # Only needed for private repos
 
 # --- Page Config ---
-st.set_page_config(
-    page_title="DLD Unit Finder 🏠",
-    page_icon="🏠",
-    layout="centered",
-)
+st.set_page_config(page_title="DLD Unit Finder 🏠", page_icon="🏠", layout="centered")
 
-# --- Custom CSS ---
+# --- CSS ---
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@300;400;600;700&display=swap');
-
 .stApp { font-family: 'IBM Plex Sans Arabic', sans-serif; }
-
 .result-card {
     background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-    color: white;
-    padding: 1.5rem 2rem;
-    border-radius: 16px;
-    margin: 1rem 0;
-    box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+    color: white; padding: 1.5rem 2rem; border-radius: 16px;
+    margin: 1rem 0; box-shadow: 0 8px 32px rgba(0,0,0,0.3);
 }
-.result-card h3 {
-    color: #e94560;
-    margin-bottom: 0.8rem;
-    font-size: 1.2rem;
-}
+.result-card h3 { color: #e94560; margin-bottom: 0.8rem; font-size: 1.2rem; }
 .result-item {
-    display: flex;
-    justify-content: space-between;
-    padding: 0.4rem 0;
-    border-bottom: 1px solid rgba(255,255,255,0.08);
+    display: flex; justify-content: space-between;
+    padding: 0.4rem 0; border-bottom: 1px solid rgba(255,255,255,0.08);
 }
 .result-label { color: #a0a0b0; font-size: 0.85rem; }
 .result-value { color: #fff; font-weight: 600; font-size: 0.95rem; }
-
 .hero-title {
-    text-align: center;
-    font-size: 2.5rem;
-    font-weight: 700;
+    text-align: center; font-size: 2.5rem; font-weight: 700;
     background: linear-gradient(135deg, #e94560, #0f3460);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
     margin-bottom: 0.3rem;
 }
-.hero-sub {
-    text-align: center;
-    color: #666;
-    font-size: 0.95rem;
-    margin-bottom: 1.5rem;
-}
-
-.match-score {
-    display: inline-block;
-    padding: 3px 10px;
-    border-radius: 20px;
-    font-size: 0.75rem;
-    font-weight: 600;
-    margin-left: 8px;
-}
+.hero-sub { text-align: center; color: #666; font-size: 0.95rem; margin-bottom: 1.5rem; }
+.match-score { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; margin-left: 8px; }
 .match-high   { background: #00c853; color: white; }
 .match-medium { background: #ff9800; color: white; }
 .match-low    { background: #f44336; color: white; }
-
-.info-box {
-    background: #f0f2f6;
-    padding: 0.8rem 1rem;
-    border-radius: 10px;
-    border-left: 4px solid #e94560;
-    margin: 0.8rem 0;
-    font-size: 0.9rem;
-}
+.info-box { background: #f0f2f6; padding: 0.8rem 1rem; border-radius: 10px; border-left: 4px solid #e94560; margin: 0.8rem 0; font-size: 0.9rem; }
 .status-ok  { border-left-color: #00c853; }
 .status-warn { border-left-color: #ff9800; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ======================================================================
-# DATABASE FUNCTIONS
-# ======================================================================
+# ===================== DATABASE =====================
 
-def download_db_from_gdrive(force=False):
-    """Download SQLite DB from Google Drive."""
-    if not GDRIVE_FILE_ID:
-        return False
-
-    # Skip if DB exists and is fresh (< 1 day), unless forced
+def download_db_from_github(force=False):
+    """Download compressed DB from GitHub Releases, decompress it."""
     if not force and os.path.exists(DB_PATH):
         age_hours = (time.time() - os.path.getmtime(DB_PATH)) / 3600
         if age_hours < 24:
             return True
 
     try:
-        url = f"https://drive.google.com/uc?export=download&id={GDRIVE_FILE_ID}&confirm=t"
-        response = requests.get(url, stream=True, timeout=180)
+        # Get release info
+        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/tags/{GITHUB_RELEASE_TAG}"
+        headers = {"Accept": "application/vnd.github+json"}
+        if GITHUB_TOKEN:
+            headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
-        if response.status_code != 200:
+        resp = requests.get(api_url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            # Try direct URL for public repos
+            direct_url = f"https://github.com/{GITHUB_REPO}/releases/download/{GITHUB_RELEASE_TAG}/dld_units.db.gz"
+            return _download_and_decompress(direct_url, {})
+        
+        release = resp.json()
+        
+        # Find the .db.gz asset
+        asset_url = None
+        for asset in release.get("assets", []):
+            if asset["name"] == "dld_units.db.gz":
+                asset_url = asset["browser_download_url"]
+                break
+        
+        if not asset_url:
             return False
 
-        # Check it's actually a SQLite file (not a Google Drive HTML page)
-        first_chunk = None
-        with open(DB_PATH + ".tmp", "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if first_chunk is None:
-                    first_chunk = chunk
-                f.write(chunk)
+        dl_headers = {}
+        if GITHUB_TOKEN:
+            dl_headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
-        # Validate: SQLite files start with "SQLite format 3"
-        if first_chunk and b"SQLite" in first_chunk[:32]:
-            os.replace(DB_PATH + ".tmp", DB_PATH)
-            return True
-        else:
-            os.remove(DB_PATH + ".tmp")
-            return False
+        return _download_and_decompress(asset_url, dl_headers)
 
-    except Exception:
-        if os.path.exists(DB_PATH + ".tmp"):
-            os.remove(DB_PATH + ".tmp")
+    except Exception as e:
+        st.warning(f"Download error: {e}")
         return False
 
 
-def download_metadata_from_gdrive():
-    """Download metadata JSON from Google Drive (same folder)."""
-    # This is optional — metadata gives us info about last update
-    gdrive_meta_id = os.environ.get("GDRIVE_METADATA_FILE_ID", "")
-    if not gdrive_meta_id:
-        return None
+def _download_and_decompress(url, headers):
+    """Download .gz file and decompress to .db"""
     try:
-        url = f"https://drive.google.com/uc?export=download&id={gdrive_meta_id}"
-        resp = requests.get(url, timeout=15)
-        if resp.status_code == 200:
-            return resp.json()
+        resp = requests.get(url, headers=headers, stream=True, timeout=300)
+        if resp.status_code != 200:
+            return False
+
+        # Save compressed
+        with open(DB_GZ_PATH, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                f.write(chunk)
+
+        # Decompress
+        with gzip.open(DB_GZ_PATH, "rb") as f_in:
+            with open(DB_PATH, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+
+        # Cleanup .gz
+        os.remove(DB_GZ_PATH)
+
+        # Validate it's a real SQLite file
+        with open(DB_PATH, "rb") as f:
+            header = f.read(16)
+        if b"SQLite" not in header:
+            os.remove(DB_PATH)
+            return False
+
+        return True
     except Exception:
-        pass
-    return None
+        for p in [DB_GZ_PATH, DB_PATH]:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except:
+                    pass
+        return False
 
 
 @st.cache_resource
 def get_db():
-    """Get SQLite DB connection (cached across reruns)."""
     if not os.path.exists(DB_PATH):
         return None
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -167,68 +155,40 @@ def get_db():
 
 
 def get_db_stats():
-    """Get database stats for display."""
     if not os.path.exists(DB_PATH):
         return None
     try:
         conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM units")
-        row_count = cursor.fetchone()[0]
-        cursor.execute("PRAGMA table_info(units)")
-        col_count = len(cursor.fetchall())
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM units")
+        rows = c.fetchone()[0]
+        c.execute("PRAGMA table_info(units)")
+        cols = len(c.fetchall())
         conn.close()
-        size_mb = os.path.getsize(DB_PATH) / (1024 * 1024)
-        mod_time = os.path.getmtime(DB_PATH)
-        return {
-            "rows": row_count,
-            "columns": col_count,
-            "size_mb": round(size_mb, 1),
-            "updated": time.strftime("%Y-%m-%d %H:%M", time.localtime(mod_time)),
-        }
-    except Exception:
+        size = os.path.getsize(DB_PATH) / (1024 * 1024)
+        mod = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(DB_PATH)))
+        return {"rows": rows, "columns": cols, "size_mb": round(size, 1), "updated": mod}
+    except:
         return None
 
 
-def get_all_db_columns():
-    """Get list of all columns in the units table."""
-    if not os.path.exists(DB_PATH):
-        return []
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(units)")
-        cols = [row[1] for row in cursor.fetchall()]
-        conn.close()
-        return cols
-    except Exception:
-        return []
-
-
-# ======================================================================
-# PROPERTY FINDER SCRAPER
-# ======================================================================
+# ===================== SCRAPER =====================
 
 def scrape_property_finder(url: str) -> dict:
-    """Scrape property details from Property Finder URL."""
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
     }
-
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
     except requests.RequestException as e:
-        return {"error": f"Failed to fetch URL: {e}"}
+        return {"error": f"Failed to fetch: {e}"}
 
     soup = BeautifulSoup(resp.text, "html.parser")
     data = {"source_url": url}
 
-    # --- JSON-LD structured data ---
+    # JSON-LD
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             ld = json.loads(script.string)
@@ -247,94 +207,68 @@ def scrape_property_finder(url: str) -> dict:
                     val = item["floorSize"].get("value")
                     if val:
                         data["area_sqft"] = float(str(val).replace(",", ""))
-        except (json.JSONDecodeError, TypeError, ValueError):
+        except:
             continue
 
-    # --- URL parsing ---
+    # URL parsing
     slug = url.rstrip("/").split("/")[-1].replace(".html", "")
     parts = slug.split("-")
-
-    prop_types = ["villa", "apartment", "townhouse", "penthouse", "duplex", "studio"]
-    for pt in prop_types:
+    for pt in ["villa", "apartment", "townhouse", "penthouse", "duplex", "studio"]:
         if pt in parts:
             data["property_type"] = pt.capitalize()
             break
-
     if parts:
         data["listing_id"] = parts[-1]
-
     if "dubai" in parts:
         idx = parts.index("dubai")
-        location_parts = parts[idx + 1 : -1]
-        if location_parts:
-            data["url_location"] = " ".join(location_parts)
+        loc = parts[idx + 1:-1]
+        if loc:
+            data["url_location"] = " ".join(loc)
 
-    # --- Page title ---
-    title_el = soup.find("h1")
-    if title_el:
-        data["title"] = title_el.get_text(strip=True)
-
-    # --- Meta tags ---
+    # Page elements
+    h1 = soup.find("h1")
+    if h1:
+        data["title"] = h1.get_text(strip=True)
     for meta in soup.find_all("meta"):
         content = meta.get("content", "")
         name = (meta.get("name") or meta.get("property") or "").lower()
         if "og:title" in name and content:
             data["og_title"] = content
-        if "description" in name and content and "meta_description" not in data:
-            data["meta_description"] = content
+    crumbs = soup.select("[class*='readcrumb'] a, [class*='Breadcrumb'] a, nav[aria-label='breadcrumb'] a")
+    texts = [b.get_text(strip=True) for b in crumbs if b.get_text(strip=True)]
+    if texts:
+        data["breadcrumbs"] = texts
 
-    # --- Breadcrumbs ---
-    crumbs = soup.select(
-        "nav[aria-label='breadcrumb'] a, .breadcrumb a, [class*='Breadcrumb'] a, "
-        "[class*='breadcrumb'] a"
-    )
-    crumb_texts = [b.get_text(strip=True) for b in crumbs if b.get_text(strip=True)]
-    if crumb_texts:
-        data["breadcrumbs"] = crumb_texts
-
-    # --- Page text regex ---
     text = soup.get_text()
     if "bedrooms" not in data:
-        m = re.search(r"(\d+)\s*(?:bed(?:room)?s?|BR)", text, re.IGNORECASE)
+        m = re.search(r"(\d+)\s*(?:bed(?:room)?s?|BR)", text, re.I)
         if m:
             data["bedrooms"] = int(m.group(1))
     if "area_sqft" not in data:
-        m = re.search(r"([\d,]+(?:\.\d+)?)\s*(?:sq\.?\s*ft|sqft)", text, re.IGNORECASE)
+        m = re.search(r"([\d,]+(?:\.\d+)?)\s*(?:sq\.?\s*ft|sqft)", text, re.I)
         if m:
             data["area_sqft"] = float(m.group(1).replace(",", ""))
 
     return data
 
 
-# ======================================================================
-# MATCHING LOGIC
-# ======================================================================
+# ===================== MATCHING =====================
 
 def find_units(conn, prop: dict) -> list:
-    """Search the DLD database for matching units."""
-    # Build search terms
     terms = []
-
     url_loc = prop.get("url_location", "")
     if url_loc:
         terms.extend(url_loc.split())
 
     title = prop.get("title") or prop.get("og_title") or prop.get("name", "")
-    stop = {
-        "for", "sale", "rent", "in", "at", "the", "a", "an", "bed", "bedroom",
-        "bedrooms", "bathroom", "bathrooms", "with", "and", "buy", "aed", "sqft",
-        "sq", "ft", "dubai", "br", "-", "of", "on", "by", "to", "from",
-    }
+    stop = {"for","sale","rent","in","at","the","a","an","bed","bedroom","bedrooms",
+            "bathroom","bathrooms","with","and","buy","aed","sqft","sq","ft","dubai",
+            "br","-","of","on","by","to","from"}
     if title:
-        words = [w.lower() for w in re.split(r"[\s,\-/|]+", title)
-                 if w.lower() not in stop and len(w) > 2]
-        terms.extend(words)
-
+        terms.extend([w.lower() for w in re.split(r"[\s,\-/|]+", title) if w.lower() not in stop and len(w) > 2])
     for crumb in prop.get("breadcrumbs", []):
-        words = [w.lower() for w in crumb.split() if len(w) > 2]
-        terms.extend(words)
+        terms.extend([w.lower() for w in crumb.split() if len(w) > 2])
 
-    # Deduplicate
     seen = set()
     unique = []
     for t in terms:
@@ -342,22 +276,16 @@ def find_units(conn, prop: dict) -> list:
         if t and t not in seen and len(t) > 2:
             seen.add(t)
             unique.append(t)
-
     if not unique:
         return []
 
     results = []
 
-    # Strategy 1: project_name_en LIKE (most precise)
-    # Try multi-word combos (longest first)
+    # Strategy 1: project_name_en
     for length in range(min(4, len(unique)), 0, -1):
         for i in range(len(unique) - length + 1):
-            candidate = " ".join(unique[i : i + length])
-            cursor = conn.execute(
-                'SELECT * FROM units WHERE LOWER(project_name_en) LIKE ? LIMIT 50',
-                (f"%{candidate}%",),
-            )
-            rows = cursor.fetchall()
+            candidate = " ".join(unique[i:i + length])
+            rows = conn.execute('SELECT * FROM units WHERE LOWER(project_name_en) LIKE ? LIMIT 50', (f"%{candidate}%",)).fetchall()
             if rows:
                 results.extend(rows)
                 break
@@ -368,26 +296,18 @@ def find_units(conn, prop: dict) -> list:
     if not results:
         for length in range(min(3, len(unique)), 0, -1):
             for i in range(len(unique) - length + 1):
-                candidate = " ".join(unique[i : i + length])
-                cursor = conn.execute(
-                    'SELECT * FROM units WHERE LOWER(master_project_en) LIKE ? LIMIT 100',
-                    (f"%{candidate}%",),
-                )
-                rows = cursor.fetchall()
+                candidate = " ".join(unique[i:i + length])
+                rows = conn.execute('SELECT * FROM units WHERE LOWER(master_project_en) LIKE ? LIMIT 100', (f"%{candidate}%",)).fetchall()
                 if rows:
                     results.extend(rows)
                     break
             if results:
                 break
 
-    # Strategy 3: area_name_en fallback
+    # Strategy 3: area_name_en
     if not results:
-        for term in unique:
-            cursor = conn.execute(
-                'SELECT * FROM units WHERE LOWER(area_name_en) LIKE ? LIMIT 100',
-                (f"%{term}%",),
-            )
-            rows = cursor.fetchall()
+        for t in unique:
+            rows = conn.execute('SELECT * FROM units WHERE LOWER(area_name_en) LIKE ? LIMIT 100', (f"%{t}%",)).fetchall()
             if rows:
                 results.extend(rows)
                 break
@@ -396,64 +316,40 @@ def find_units(conn, prop: dict) -> list:
 
 
 def rank_results(rows, prop, search_terms):
-    """Rank results by relevance."""
     scored = []
     search_str = " ".join(search_terms).lower()
-
     for row in rows:
         d = dict(row)
         score = 0
-
-        # Project name similarity
         project = (d.get("project_name_en") or "").lower()
         if project:
             score += SequenceMatcher(None, search_str, project).ratio() * 50
-
-        # Area match
         area = (d.get("area_name_en") or "").lower()
         for t in search_terms:
-            if t in area:
-                score += 10
-
-        # Master project match
+            if t in area: score += 10
         master = (d.get("master_project_en") or "").lower()
         for t in search_terms:
-            if t in master:
-                score += 15
-
-        # Property type match
+            if t in master: score += 15
         ptype = prop.get("property_type", "").lower()
         db_type = (d.get("property_type_en") or "").lower()
-        if ptype and ptype in db_type:
-            score += 10
-
-        # Bedrooms
+        if ptype and ptype in db_type: score += 10
         beds = prop.get("bedrooms")
         db_rooms = d.get("rooms")
         if beds is not None and db_rooms:
             try:
-                if int(beds) == int(float(db_rooms)):
-                    score += 5
-            except (ValueError, TypeError):
-                pass
-
-        # Area size (sqm→sqft conversion)
+                if int(beds) == int(float(db_rooms)): score += 5
+            except: pass
         sqft = prop.get("area_sqft")
         db_area = d.get("actual_area")
         if sqft and db_area:
             try:
                 db_sqft = float(db_area) * 10.764
-                if abs(sqft - db_sqft) < sqft * 0.15:
-                    score += 8
-            except (ValueError, TypeError):
-                pass
-
+                if abs(sqft - db_sqft) < sqft * 0.15: score += 8
+            except: pass
         d["_match_score"] = score
         scored.append(d)
 
     scored.sort(key=lambda x: x["_match_score"], reverse=True)
-
-    # Deduplicate by unit_number + land_number
     seen = set()
     unique = []
     for d in scored:
@@ -461,15 +357,11 @@ def rank_results(rows, prop, search_terms):
         if key not in seen:
             seen.add(key)
             unique.append(d)
-
     return unique
 
 
-# ======================================================================
-# DISPLAY HELPERS
-# ======================================================================
+# ===================== UI =====================
 
-# Fields to show in result cards + their display labels
 DISPLAY_FIELDS = [
     ("unit_number", "🏢 Unit Number"),
     ("land_number", "📍 Land Number"),
@@ -487,7 +379,7 @@ DISPLAY_FIELDS = [
     ("property_sub_type_en", "🏠 Sub Type"),
     ("rooms_en", "🛏️ Rooms"),
     ("floor", "📊 Floor"),
-    ("actual_area", "📐 Actual Area (sqm)"),
+    ("actual_area", "📐 Area (sqm)"),
     ("common_area", "📐 Common Area"),
     ("actual_common_area", "📐 Actual Common Area"),
     ("unit_balcony_area", "🌿 Balcony Area"),
@@ -497,214 +389,121 @@ DISPLAY_FIELDS = [
     ("is_free_hold", "📜 Freehold"),
     ("is_lease_hold", "📜 Leasehold"),
     ("is_registered", "✅ Registered"),
-    ("munc_number", "🔢 Municipality Number"),
-    ("munc_zip_code", "📮 ZIP Code"),
+    ("munc_number", "🔢 Municipality #"),
+    ("munc_zip_code", "📮 ZIP"),
     ("parcel_id", "🔢 Parcel ID"),
-    ("pre_registration_number", "🔢 Pre-Registration #"),
+    ("pre_registration_number", "🔢 Pre-Reg #"),
     ("property_id", "🆔 Property ID"),
-    ("parent_property_id", "🆔 Parent Property ID"),
-    ("grandparent_property_id", "🆔 Grandparent Property ID"),
-    ("creation_date", "📅 Creation Date"),
+    ("parent_property_id", "🆔 Parent ID"),
+    ("grandparent_property_id", "🆔 Grandparent ID"),
+    ("creation_date", "📅 Created"),
 ]
 
 
-def render_result_card(match, index):
-    """Render a single result card."""
+def render_card(match, i):
     score = match.get("_match_score", 0)
-    if score > 40:
-        badge = '<span class="match-score match-high">High Match</span>'
-    elif score > 20:
-        badge = '<span class="match-score match-medium">Medium Match</span>'
-    else:
-        badge = '<span class="match-score match-low">Low Match</span>'
+    if score > 40: badge = '<span class="match-score match-high">High Match</span>'
+    elif score > 20: badge = '<span class="match-score match-medium">Medium Match</span>'
+    else: badge = '<span class="match-score match-low">Low Match</span>'
 
     project = match.get("project_name_en") or match.get("project_name_ar") or "Unknown"
-
     rows_html = ""
-    for field_key, field_label in DISPLAY_FIELDS:
-        val = match.get(field_key)
-        if val and str(val).strip() and str(val).strip() != "0":
-            rows_html += f"""
-            <div class="result-item">
-                <span class="result-label">{field_label}</span>
-                <span class="result-value">{val}</span>
-            </div>"""
+    for key, label in DISPLAY_FIELDS:
+        val = match.get(key)
+        if val and str(val).strip() and str(val).strip() not in ("0", "null", "0.00"):
+            rows_html += f'<div class="result-item"><span class="result-label">{label}</span><span class="result-value">{val}</span></div>'
 
-    st.markdown(
-        f"""<div class="result-card">
-            <h3>#{index} — {project} {badge}</h3>
-            {rows_html}
-        </div>""",
-        unsafe_allow_html=True,
-    )
+    st.markdown(f'<div class="result-card"><h3>#{i} — {project} {badge}</h3>{rows_html}</div>', unsafe_allow_html=True)
 
-
-# ======================================================================
-# SIDEBAR — DATA STATUS & MANUAL UPDATE
-# ======================================================================
 
 def render_sidebar():
-    """Sidebar with DB status and manual update button."""
     with st.sidebar:
         st.markdown("## ⚙️ Database Status")
-
         stats = get_db_stats()
         if stats:
             st.markdown(
-                f'<div class="info-box status-ok">'
-                f'✅ Database loaded<br>'
+                f'<div class="info-box status-ok">✅ Database loaded<br>'
                 f'📊 <b>{stats["rows"]:,}</b> units<br>'
-                f'📋 <b>{stats["columns"]}</b> columns (all preserved)<br>'
+                f'📋 <b>{stats["columns"]}</b> columns<br>'
                 f'💾 <b>{stats["size_mb"]}</b> MB<br>'
-                f'🕐 Updated: <b>{stats["updated"]}</b>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
+                f'🕐 Updated: <b>{stats["updated"]}</b></div>',
+                unsafe_allow_html=True)
         else:
-            st.markdown(
-                '<div class="info-box status-warn">'
-                '⚠️ No database loaded<br>'
-                'Click "Update Now" to download.'
-                '</div>',
-                unsafe_allow_html=True,
-            )
+            st.markdown('<div class="info-box status-warn">⚠️ No database. Click Update Now.</div>', unsafe_allow_html=True)
 
         st.markdown("---")
         st.markdown("## 🔄 Manual Update")
-        st.caption("Download the latest DLD data from Google Drive")
-
+        st.caption("Download latest data from GitHub Releases")
         if st.button("🔄 Update Now", use_container_width=True, type="primary"):
-            if not GDRIVE_FILE_ID:
-                st.error("❌ GDRIVE_FILE_ID not configured!")
+            with st.spinner("📥 Downloading & decompressing..."):
+                ok = download_db_from_github(force=True)
+            if ok:
+                get_db.clear()
+                st.success("✅ Updated!")
+                st.rerun()
             else:
-                with st.spinner("📥 Downloading latest database..."):
-                    success = download_db_from_gdrive(force=True)
-                if success:
-                    # Clear cached DB connection so it reconnects
-                    get_db.clear()
-                    st.success("✅ Database updated!")
-                    st.rerun()
-                else:
-                    st.error("❌ Download failed. Check GDRIVE_FILE_ID.")
+                st.error("❌ Download failed. Check repo settings.")
 
         st.markdown("---")
-        st.markdown("## ℹ️ About")
-        st.caption(
-            "Data source: Dubai Land Department via Dubai Pulse (Open Data). "
-            "Auto-updates weekly via GitHub Actions. "
-            "For personal use only."
-        )
+        st.caption("Data: DLD via Dubai Pulse (Open Data)")
 
-        # Show all columns in DB (collapsible)
-        all_cols = get_all_db_columns()
-        if all_cols:
-            with st.expander(f"📋 All {len(all_cols)} DB columns"):
-                for i, col in enumerate(all_cols, 1):
-                    st.text(f"{i:2d}. {col}")
-
-
-# ======================================================================
-# MAIN APP
-# ======================================================================
 
 def main():
-    # Download DB from GDrive on first load
-    if not os.path.exists(DB_PATH) and GDRIVE_FILE_ID:
+    if not os.path.exists(DB_PATH):
         with st.spinner("📥 First load — downloading database..."):
-            download_db_from_gdrive(force=True)
+            download_db_from_github(force=True)
 
-    # Sidebar
     render_sidebar()
 
-    # Hero
     st.markdown('<div class="hero-title">🏠 DLD Unit Finder</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="hero-sub">Property Finder Link → Unit Number & Full DLD Data | مجاني 100%</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown('<div class="hero-sub">Property Finder Link → Unit Number & Full DLD Data | مجاني 100%</div>', unsafe_allow_html=True)
 
-    # Input
-    url = st.text_input(
-        "🔗 Property Finder URL",
-        placeholder="https://www.propertyfinder.ae/en/plp/buy/villa-for-sale-dubai-...",
-        help="Paste any Property Finder listing URL",
-    )
+    url = st.text_input("🔗 Property Finder URL", placeholder="https://www.propertyfinder.ae/en/plp/buy/...")
 
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        search_btn = st.button("🔍 Find Unit Number", use_container_width=True, type="primary")
+        btn = st.button("🔍 Find Unit Number", use_container_width=True, type="primary")
 
-    if search_btn and url:
+    if btn and url:
         if "propertyfinder" not in url.lower():
-            st.error("❌ Please enter a valid Property Finder URL")
+            st.error("❌ Invalid Property Finder URL")
             return
 
         conn = get_db()
-        if conn is None:
-            st.error(
-                "❌ Database not loaded. Click **🔄 Update Now** in the sidebar, "
-                "or run `python convert_csv_to_db.py` locally."
-            )
+        if not conn:
+            st.error("❌ No database. Click **🔄 Update Now** in sidebar.")
             return
 
-        # --- Step 1: Scrape ---
         with st.spinner("🌐 Scraping Property Finder..."):
             prop = scrape_property_finder(url)
-
         if "error" in prop:
             st.error(f"❌ {prop['error']}")
             return
 
-        # Show scraped data
-        st.markdown("### 📋 Scraped Property Details")
-        with st.expander("View details from Property Finder", expanded=True):
-            display = {
+        st.markdown("### 📋 Scraped Details")
+        with st.expander("View", expanded=True):
+            for k, v in {
                 "Title": prop.get("title") or prop.get("og_title") or prop.get("name", "—"),
                 "Type": prop.get("property_type", "—"),
                 "Bedrooms": prop.get("bedrooms", "—"),
                 "Area (sqft)": prop.get("area_sqft", "—"),
-                "Location (URL)": prop.get("url_location", "—"),
-                "Breadcrumbs": " → ".join(prop.get("breadcrumbs", [])) or "—",
-            }
-            for k, v in display.items():
+                "Location": prop.get("url_location", "—"),
+            }.items():
                 st.markdown(f"**{k}:** {v}")
 
-        # --- Step 2: Search ---
-        with st.spinner("🔍 Searching DLD database..."):
+        with st.spinner("🔍 Searching DLD..."):
             matches = find_units(conn, prop)
 
-        # --- Step 3: Results ---
         if matches:
-            n = len(matches)
-            st.markdown(f"### ✅ Found {n} potential match{'es' if n > 1 else ''}")
-            st.markdown(
-                '<div class="info-box">'
-                "💡 Results ranked by relevance. Top result is most likely correct. "
-                "All 46 DLD columns are shown when data exists."
-                "</div>",
-                unsafe_allow_html=True,
-            )
-
-            for i, match in enumerate(matches[:10], 1):
-                render_result_card(match, i)
-
+            st.markdown(f"### ✅ {len(matches)} match{'es' if len(matches) > 1 else ''}")
+            st.markdown('<div class="info-box">💡 Top result = most likely. All 46 DLD columns shown.</div>', unsafe_allow_html=True)
+            for i, m in enumerate(matches[:10], 1):
+                render_card(m, i)
         else:
-            st.warning("⚠️ No matching units found.")
-            st.markdown(
-                "This could mean the property is **off-plan** (not yet registered), "
-                "or the project name differs between Property Finder and DLD records. "
-                "Try a different listing from the same project."
-            )
+            st.warning("⚠️ No matches. Property may be off-plan or named differently in DLD.")
 
-    # Footer
     st.markdown("---")
-    st.markdown(
-        "<p style='text-align:center; color:#888; font-size:0.8rem;'>"
-        "Data: Dubai Land Department via Dubai Pulse (Open Data) • "
-        "All 46 columns preserved — zero data loss • "
-        "Personal use only</p>",
-        unsafe_allow_html=True,
-    )
+    st.markdown('<p style="text-align:center;color:#888;font-size:0.8rem;">DLD Open Data • 46 columns preserved • Personal use</p>', unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
