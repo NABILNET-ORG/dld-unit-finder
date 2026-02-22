@@ -174,13 +174,29 @@ def get_db_stats():
 
 # ===================== URL PARSER + SCRAPER =====================
 
+# Known PF area keywords to strip from project name
+PF_AREA_WORDS = {
+    "dubai", "south", "north", "east", "west", "central", "world",
+    "marina", "hills", "creek", "harbour", "harbor", "islands",
+    "land", "sports", "studio", "motor", "production", "media",
+    "silicon", "oasis", "investment", "international",
+}
+
 def parse_pf_url(url: str) -> dict:
     """
-    Parse Property Finder URL — always works, no network needed.
-    URL pattern: {type}-for-{sale/rent}-dubai-{location-parts}-{listing_id}.html
+    Parse Property Finder URL with smart project name extraction.
     
-    Example: villa-for-sale-dubai-the-valley-farm-gardens-16135129.html
-    → type=Villa, location=["the valley", "farm gardens"], id=16135129
+    PF URL pattern: {type}-for-{sale/rent}-dubai-{area}-{subarea}-{project}-{building}-{id}.html
+    
+    Key insight: project/building name is always at the END (before listing ID).
+    
+    Examples:
+      villa-for-sale-dubai-the-valley-farm-gardens-16135129
+        → segments: [the, valley, farm, gardens]  → project_hint: "farm gardens", area_hint: "the valley"
+    
+      townhouse-for-sale-dubai-dubai-south-dubai-world-central-emaar-south-greenway-15954382
+        → segments: [dubai, south, dubai, world, central, emaar, south, greenway]
+        → project_hint: "greenway", area_hint: "emaar south"
     """
     data = {"source_url": url}
     
@@ -197,147 +213,196 @@ def parse_pf_url(url: str) -> dict:
     if parts:
         data["listing_id"] = parts[-1]
     
-    # Location parts (everything between "dubai" and listing_id)
+    # Location segments: everything between first "dubai" and listing_id
     if "dubai" in parts:
         idx = parts.index("dubai")
         loc_parts = parts[idx + 1:-1]  # exclude listing id
         if loc_parts:
             data["url_location"] = " ".join(loc_parts)
+            
+            # Smart segmentation: build location hierarchy from END to START
+            # Remove duplicate "dubai" from within location
+            clean_parts = [p for p in loc_parts if p != "dubai"]
+            
+            if clean_parts:
+                # Generate candidates: 1, 2, 3 words from the end of URL
+                # Let the DB matching figure out which is the actual project
+                data["project_candidates"] = []
+                for n in range(1, min(5, len(clean_parts) + 1)):
+                    project = " ".join(clean_parts[-n:])
+                    context = " ".join(clean_parts[:-n]) if n < len(clean_parts) else ""
+                    data["project_candidates"].append({
+                        "project": project,
+                        "context": context,
+                    })
     
     return data
 
 
 def try_scrape_pf(url: str) -> dict:
     """
-    Try to scrape Property Finder page for extra details.
-    May fail from cloud servers (PF blocks bots). That's OK — URL parsing is enough.
+    Try to scrape PF page using multiple strategies to bypass bot detection.
+    Order: social bot UAs → cloudscraper → Google Cache → regular request.
     """
     extra = {}
+    html = ""
     
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "Referer": "https://www.google.com/",
-    })
-
-    try:
-        resp = session.get(url, timeout=15, allow_redirects=True)
-        resp.raise_for_status()
-        html = resp.text
-        
-        # Check if we got real content (not a JS-blocked page)
-        if len(html) < 5000 or "javascript" in html.lower()[:500]:
-            extra["_scrape_status"] = "blocked"
-            return extra
-        
-        extra["_scrape_status"] = "ok"
-        extra["_html_length"] = len(html)
-        
-        soup = BeautifulSoup(html, "html.parser")
-        text = soup.get_text(" ", strip=True)
-        
-        # Title
-        h1 = soup.find("h1")
-        if h1:
-            extra["title"] = h1.get_text(strip=True)
-        
-        # og:title
-        for meta in soup.find_all("meta"):
-            content = meta.get("content", "").strip()
-            prop_name = (meta.get("name") or meta.get("property") or "").lower()
-            if "og:title" in prop_name and content:
-                extra["og_title"] = re.sub(r"\s*\|\s*Property Finder.*$", "", content)
-        
-        # Bedrooms
-        m = re.search(r"(\d+)\s*(?:Bed(?:room)?s?|BR)\b", text, re.I)
-        if m:
-            extra["bedrooms"] = int(m.group(1))
-        
-        # Area sqft
-        m = re.search(r"([\d,]+(?:\.\d+)?)\s*(?:sqft|sq\.?\s*ft)\b", text, re.I)
-        if m:
-            extra["area_sqft"] = float(m.group(1).replace(",", ""))
-        
-        # DLD Zone name (from regulatory info section)
-        zone_match = re.search(r"Zone\s*name\s*[:\s]*([A-Za-z][A-Za-z\s\d]+)", text)
-        if zone_match:
-            extra["dld_zone_name"] = zone_match.group(1).strip()
-        
-        # Reference number
-        ref_match = re.search(r"Reference\s*[:\s]*([A-Za-z0-9\-]+)", text)
-        if ref_match:
-            extra["reference"] = ref_match.group(1).strip()
-        
-        # Full address: "Farm Gardens 1, Farm Gardens, The Valley, Dubai"
-        addr_match = re.search(r"([\w\s]+(?:,\s*[\w\s]+){2,3},\s*Dubai)", text)
-        if addr_match:
-            extra["full_address"] = addr_match.group(1).strip()
-            addr_parts = [p.strip() for p in addr_match.group(1).split(",")]
-            if len(addr_parts) >= 3:
-                extra["sub_community"] = addr_parts[0]
-                extra["community"] = addr_parts[1]
-                extra["master_community"] = addr_parts[2]
-        
-        # Breadcrumbs
-        crumb_texts = []
-        for link in soup.find_all("a"):
-            href = link.get("href", "")
-            txt = link.get_text(strip=True)
-            if txt and ("for-sale" in href or "for-rent" in href) and len(txt) > 2:
-                if txt not in crumb_texts:
-                    crumb_texts.append(txt)
-        if crumb_texts:
-            extra["breadcrumbs"] = crumb_texts
-        
-        # JSON-LD
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                ld = json.loads(script.string)
-                items = ld if isinstance(ld, list) else [ld]
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    if "numberOfRooms" in item and "bedrooms" not in extra:
-                        extra["bedrooms"] = int(item["numberOfRooms"])
-                    if "floorSize" in item and isinstance(item["floorSize"], dict):
-                        val = item["floorSize"].get("value")
-                        if val and "area_sqft" not in extra:
-                            extra["area_sqft"] = float(str(val).replace(",", ""))
-            except:
-                continue
-    except:
-        extra["_scrape_status"] = "failed"
+    # === Strategy 1: Social bot user agents ===
+    # PF MUST whitelist these for link previews (WhatsApp, Facebook, etc.)
+    social_uas = [
+        "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+        "WhatsApp/2.23.20.0",
+        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        "Twitterbot/1.0",
+        "TelegramBot (like TwitterBot)",
+    ]
+    for ua in social_uas:
+        try:
+            resp = requests.get(url, headers={"User-Agent": ua}, timeout=15, allow_redirects=True)
+            if resp.status_code == 200 and len(resp.text) > 5000 and "javascript" not in resp.text[:500].lower():
+                html = resp.text
+                extra["_scrape_method"] = ua.split("/")[0]
+                break
+        except:
+            continue
+    
+    # === Strategy 2: cloudscraper (bypasses Cloudflare) ===
+    if not html:
+        try:
+            import cloudscraper
+            scraper = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "mobile": False}
+            )
+            resp = scraper.get(url, timeout=15)
+            if resp.status_code == 200 and len(resp.text) > 5000 and "javascript" not in resp.text[:500].lower():
+                html = resp.text
+                extra["_scrape_method"] = "cloudscraper"
+        except ImportError:
+            pass
+        except:
+            pass
+    
+    # === Strategy 3: Google Cache ===
+    if not html:
+        try:
+            cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{url}&strip=1"
+            resp = requests.get(cache_url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }, timeout=15)
+            if resp.status_code == 200 and len(resp.text) > 5000:
+                html = resp.text
+                extra["_scrape_method"] = "google_cache"
+        except:
+            pass
+    
+    # === Strategy 4: Regular browser request ===
+    if not html:
+        try:
+            resp = requests.get(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.google.com/",
+            }, timeout=15, allow_redirects=True)
+            if resp.status_code == 200 and len(resp.text) > 5000 and "javascript" not in resp.text[:500].lower():
+                html = resp.text
+                extra["_scrape_method"] = "regular"
+        except:
+            pass
+    
+    # === No HTML? Give up. ===
+    if not html:
+        extra["_scrape_status"] = "blocked"
+        return extra
+    
+    # === Parse the HTML ===
+    extra["_scrape_status"] = "ok"
+    extra["_html_length"] = len(html)
+    
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    
+    # Title
+    h1 = soup.find("h1")
+    if h1:
+        t = h1.get_text(strip=True)
+        if "javascript" not in t.lower():
+            extra["title"] = t
+    
+    # og:title
+    for meta in soup.find_all("meta"):
+        content = meta.get("content", "").strip()
+        prop_name = (meta.get("name") or meta.get("property") or "").lower()
+        if "og:title" in prop_name and content:
+            extra["og_title"] = re.sub(r"\s*\|\s*Property Finder.*$", "", content)
+    
+    # Bedrooms
+    m = re.search(r"(\d+)\s*(?:Bed(?:room)?s?|BR)\b", text, re.I)
+    if m:
+        extra["bedrooms"] = int(m.group(1))
+    
+    # Area sqft
+    m = re.search(r"([\d,]+(?:\.\d+)?)\s*(?:sqft|sq\.?\s*ft)\b", text, re.I)
+    if m:
+        extra["area_sqft"] = float(m.group(1).replace(",", ""))
+    
+    # DLD Zone name (from regulatory info)
+    zone_match = re.search(r"Zone\s*name\s*[:\s]*([A-Za-z][A-Za-z\s\d]+)", text)
+    if zone_match:
+        extra["dld_zone_name"] = zone_match.group(1).strip()
+    
+    # Reference
+    ref_match = re.search(r"Reference\s*[:\s]*([A-Za-z0-9\-]+)", text)
+    if ref_match:
+        extra["reference"] = ref_match.group(1).strip()
+    
+    # Full address: "Farm Gardens 1, Farm Gardens, The Valley, Dubai"
+    addr_match = re.search(r"([\w\s]+(?:,\s*[\w\s]+){2,3},\s*Dubai)", text)
+    if addr_match:
+        extra["full_address"] = addr_match.group(1).strip()
+        addr_parts = [p.strip() for p in addr_match.group(1).split(",")]
+        if len(addr_parts) >= 3:
+            extra["sub_community"] = addr_parts[0]
+            extra["community"] = addr_parts[1]
+            extra["master_community"] = addr_parts[2]
+    
+    # Breadcrumbs
+    crumb_texts = []
+    for link in soup.find_all("a"):
+        href = link.get("href", "")
+        txt = link.get_text(strip=True)
+        if txt and ("for-sale" in href or "for-rent" in href) and len(txt) > 2:
+            if txt not in crumb_texts:
+                crumb_texts.append(txt)
+    if crumb_texts:
+        extra["breadcrumbs"] = crumb_texts
+    
+    # JSON-LD
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            ld = json.loads(script.string)
+            items = ld if isinstance(ld, list) else [ld]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if "numberOfRooms" in item and "bedrooms" not in extra:
+                    extra["bedrooms"] = int(item["numberOfRooms"])
+                if "floorSize" in item and isinstance(item["floorSize"], dict):
+                    val = item["floorSize"].get("value")
+                    if val and "area_sqft" not in extra:
+                        extra["area_sqft"] = float(str(val).replace(",", ""))
+        except:
+            continue
     
     return extra
 
 
 def get_property_data(url: str) -> dict:
-    """
-    Combine URL parsing (always works) + optional scraping (bonus data).
-    """
-    # 1. Parse URL (guaranteed)
     data = parse_pf_url(url)
-    
-    # 2. Try scraping (may fail from cloud — that's OK)
     extra = try_scrape_pf(url)
-    
-    # Merge — scrape data supplements URL data, doesn't replace it
     for k, v in extra.items():
         if v and (k not in data or not data[k]):
             data[k] = v
-    
     return data
 
 
@@ -345,14 +410,11 @@ def get_property_data(url: str) -> dict:
 
 def extract_search_phrases(prop: dict) -> list:
     """
-    Extract meaningful search phrases from property data.
-    Works with URL-only data OR full scraped data.
-    
-    Key: PF URL "the-valley-farm-gardens" needs smart splitting into
-    master_project="The Valley" + project="Farm Gardens"
+    Build search phrases from best available data.
+    Priority: scraped community > project_hint from URL > URL splits
     """
     phrases = []
-    MIN_LEN = 4  # Skip short garbage like "the"
+    MIN_LEN = 4
     
     # 1. Scraped community data (best if available)
     for key in ["sub_community", "community", "master_community", "dld_zone_name"]:
@@ -360,24 +422,16 @@ def extract_search_phrases(prop: dict) -> list:
         if val and len(val) >= MIN_LEN:
             phrases.append(val)
     
-    # 2. URL location — main data source when scraping fails
-    url_loc = prop.get("url_location", "")
-    if url_loc and len(url_loc) >= MIN_LEN:
-        phrases.append(url_loc)
-        # Try all split points: "the valley farm gardens" →
-        #   right="farm gardens" left="the valley"  ← correct!
-        #   right="valley farm gardens" left="the"   ← "the" filtered by MIN_LEN
-        parts = url_loc.split()
-        if len(parts) >= 2:
-            for split_at in range(1, len(parts)):
-                left = " ".join(parts[:split_at])
-                right = " ".join(parts[split_at:])
-                if len(right) >= MIN_LEN:
-                    phrases.append(right)
-                if len(left) >= MIN_LEN:
-                    phrases.append(left)
+    # 2. Project candidates from URL (smart extraction from END of URL)
+    for cand in prop.get("project_candidates", []):
+        p = cand.get("project", "")
+        c = cand.get("context", "")
+        if p and len(p) >= MIN_LEN:
+            phrases.append(p)
+        if c and len(c) >= MIN_LEN:
+            phrases.append(c)
     
-    # 3. Page title (skip garbage like "JavaScript is disabled")
+    # 4. Page title (skip garbage)
     title = prop.get("title") or prop.get("og_title", "")
     if title and "javascript" not in title.lower() and len(title) > 10:
         stop = {"for","sale","rent","in","at","a","an","bed","bedroom","bedrooms",
@@ -389,18 +443,18 @@ def extract_search_phrases(prop: dict) -> list:
         if len(words) >= 2:
             phrases.append(" ".join(words))
     
-    # 4. Breadcrumbs
-    for crumb in prop.get("breadcrumbs", []):
-        c = crumb.strip()
-        if len(c) >= MIN_LEN and c.lower() not in ("dubai", "home", "buy", "rent", "properties", "uae"):
-            phrases.append(c)
-    
-    # Deduplicate, enforce MIN_LEN
+    # Deduplicate, enforce MIN_LEN, skip generic singles
+    GENERIC_SINGLES = {"gardens","garden","tower","towers","heights","park","view","views",
+                       "bay","city","square","hill","hills","lake","lakes","creek","gate",
+                       "gates","village","residence","residences","court","place","point",
+                       "plaza","walk","boulevard","avenue","street","terrace","estate"}
     seen = set()
     unique = []
     for p in phrases:
         p_lower = p.strip().lower()
         if p_lower and p_lower not in seen and len(p_lower) >= MIN_LEN:
+            if " " not in p_lower and p_lower in GENERIC_SINGLES:
+                continue
             seen.add(p_lower)
             unique.append(p_lower)
     
@@ -508,12 +562,59 @@ def find_units(conn, prop: dict) -> list:
                     results.extend(rows)
                     break
     
-    # === STRATEGY 5: Individual significant words (last resort) ===
+    # === STRATEGY 5: Multi-word AND search (smart — handles name variations) ===
+    # "farm gardens" failed as exact phrase? Try: project LIKE '%farm%' AND project LIKE '%garden%'
+    # This catches "FARM GARDENS 1,2", "The Farm Gardens", etc.
     if not results:
         noise = {"the","and","for","villa","apartment","tower","building","residence",
-                 "residences","dubai","phase","block","cluster"}
+                 "residences","dubai","phase","block","cluster","on","at","in","of"}
+        url_loc = prop.get("url_location", "")
+        if url_loc:
+            parts = url_loc.split()
+            # Try combining project words + master words with AND
+            for split_at in range(1, len(parts)):
+                master_words = [w for w in parts[:split_at] if w not in noise and len(w) > 2]
+                project_words = [w for w in parts[split_at:] if w not in noise and len(w) > 2]
+                
+                if project_words and master_words:
+                    # Build: project LIKE '%farm%' AND project LIKE '%garden%' AND master LIKE '%valley%'
+                    conditions = []
+                    params = []
+                    for w in project_words:
+                        conditions.append('LOWER(project_name_en) LIKE ?')
+                        params.append(f'%{w}%')
+                    for w in master_words:
+                        conditions.append('LOWER(master_project_en) LIKE ?')
+                        params.append(f'%{w}%')
+                    
+                    sql = f'SELECT * FROM units WHERE {" AND ".join(conditions)} LIMIT 200'
+                    rows = conn.execute(sql, params).fetchall()
+                    if rows:
+                        results.extend(rows)
+                        break
+    
+    # === STRATEGY 6: Individual project words with AND ===
+    if not results:
+        noise = {"the","and","for","villa","apartment","tower","building","residence",
+                 "residences","dubai","phase","block","cluster","on","at","in","of"}
         for phrase in phrases:
             words = [w for w in phrase.split() if w not in noise and len(w) > 3]
+            if len(words) >= 2:
+                conditions = [f'LOWER(project_name_en) LIKE ?' for _ in words]
+                params = [f'%{w}%' for w in words]
+                sql = f'SELECT * FROM units WHERE {" AND ".join(conditions)} LIMIT 200'
+                rows = conn.execute(sql, params).fetchall()
+                if rows:
+                    results.extend(rows)
+                    break
+    
+    # === STRATEGY 7: Single significant words (last resort) ===
+    if not results:
+        noise = {"the","and","for","villa","apartment","tower","building","residence",
+                 "residences","dubai","phase","block","cluster","gardens","park",
+                 "heights","tower","square","city","view","bay","on","at","in","of"}
+        for phrase in phrases:
+            words = [w for w in phrase.split() if w not in noise and len(w) > 4]
             for word in words:
                 rows = conn.execute(
                     'SELECT * FROM units WHERE LOWER(project_name_en) LIKE ? LIMIT 100',
@@ -708,6 +809,38 @@ def render_sidebar():
         st.caption("Data: DLD via Dubai Pulse (Open Data)")
 
 
+def manual_search(conn, query: str, search_field: str) -> list:
+    """Direct text search against a specific field."""
+    field_map = {
+        "Project Name": "project_name_en",
+        "Master Project": "master_project_en",
+        "Area Name": "area_name_en",
+        "Unit Number": "unit_number",
+        "Building": "building_number",
+        "Property ID": "property_id",
+    }
+    col = field_map.get(search_field, "project_name_en")
+    
+    if col in ("unit_number", "property_id", "building_number"):
+        # Exact match for IDs
+        rows = conn.execute(
+            f'SELECT * FROM units WHERE LOWER("{col}") = ? LIMIT 200',
+            (query.lower(),)
+        ).fetchall()
+        if not rows:
+            rows = conn.execute(
+                f'SELECT * FROM units WHERE LOWER("{col}") LIKE ? LIMIT 200',
+                (f"%{query.lower()}%",)
+            ).fetchall()
+    else:
+        rows = conn.execute(
+            f'SELECT * FROM units WHERE LOWER("{col}") LIKE ? LIMIT 200',
+            (f"%{query.lower()}%",)
+        ).fetchall()
+    
+    return [dict(r) for r in rows]
+
+
 def main():
     if not os.path.exists(DB_PATH):
         with st.spinner("📥 First load — downloading database..."):
@@ -716,65 +849,105 @@ def main():
     render_sidebar()
 
     st.markdown('<div class="hero-title">🏠 DLD Unit Finder</div>', unsafe_allow_html=True)
-    st.markdown('<div class="hero-sub">Property Finder Link → Unit Number & Full DLD Data | مجاني 100%</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero-sub">Find Unit Numbers & Full DLD Data | مجاني 100%</div>', unsafe_allow_html=True)
 
-    url = st.text_input("🔗 Property Finder URL", placeholder="https://www.propertyfinder.ae/en/plp/buy/...")
-
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        btn = st.button("🔍 Find Unit Number", use_container_width=True, type="primary")
-
-    if btn and url:
-        if "propertyfinder" not in url.lower():
-            st.error("❌ Invalid Property Finder URL")
-            return
-
-        conn = get_db()
-        if not conn:
-            st.error("❌ No database. Click **🔄 Update Now** in sidebar.")
-            return
-
-        with st.spinner("🔍 Analyzing property link..."):
-            prop = get_property_data(url)
-        if "error" in prop:
-            st.error(f"❌ {prop['error']}")
-            return
+    tab1, tab2 = st.tabs(["🔗 Property Finder URL", "🔍 Manual Search"])
+    
+    conn = get_db()
+    
+    # ============= TAB 1: URL SEARCH =============
+    with tab1:
+        url = st.text_input("🔗 Paste Property Finder URL", placeholder="https://www.propertyfinder.ae/en/plp/buy/...")
         
-        scrape_status = prop.get("_scrape_status", "not attempted")
-        scrape_note = ""
-        if scrape_status == "blocked":
-            scrape_note = " *(scraping blocked by PF — using URL data only)*"
-        elif scrape_status == "failed":
-            scrape_note = " *(scraping failed — using URL data only)*"
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            btn = st.button("🔍 Find Unit Number", use_container_width=True, type="primary")
 
-        st.markdown(f"### 📋 Property Details{scrape_note}")
-        with st.expander("View", expanded=True):
-            for k, v in {
-                "Title": prop.get("title") or prop.get("og_title", "—"),
-                "Type": prop.get("property_type", "—"),
-                "Bedrooms": prop.get("bedrooms", "—"),
-                "Area (sqft)": prop.get("area_sqft", "—"),
-                "URL Location": prop.get("url_location", "—"),
-                "Community": prop.get("community", "—"),
-                "Master Community": prop.get("master_community", "—"),
-                "DLD Zone": prop.get("dld_zone_name", "—"),
-            }.items():
-                st.markdown(f"**{k}:** {v}")
+        if btn and url:
+            if "propertyfinder" not in url.lower():
+                st.error("❌ Invalid Property Finder URL")
+                return
+
+            if not conn:
+                st.error("❌ No database. Click **🔄 Update Now** in sidebar.")
+                return
+
+            with st.spinner("🔍 Analyzing property link..."):
+                prop = get_property_data(url)
+            if "error" in prop:
+                st.error(f"❌ {prop['error']}")
+                return
             
-            phrases = extract_search_phrases(prop)
-            if phrases:
-                st.markdown(f"**Search phrases:** {', '.join([f'`{p}`' for p in phrases[:8]])}")
+            scrape_status = prop.get("_scrape_status", "not attempted")
+            scrape_method = prop.get("_scrape_method", "")
+            scrape_note = ""
+            if scrape_status == "blocked":
+                scrape_note = " *(PF blocked all methods — URL data only)*"
+            elif scrape_status == "failed":
+                scrape_note = " *(using URL data)*"
+            elif scrape_method:
+                scrape_note = f" *(scraped via {scrape_method})*"
 
-        with st.spinner("🔍 Searching DLD..."):
-            matches = find_units(conn, prop)
+            st.markdown(f"### 📋 Property Details{scrape_note}")
+            with st.expander("View", expanded=True):
+                for k, v in {
+                    "Type": prop.get("property_type", "—"),
+                    "URL Location": prop.get("url_location", "—"),
+                    "Title": prop.get("title") or prop.get("og_title", "—"),
+                    "Bedrooms": prop.get("bedrooms", "—"),
+                    "Area (sqft)": prop.get("area_sqft", "—"),
+                    "DLD Zone": prop.get("dld_zone_name", "—"),
+                }.items():
+                    if str(v) != "—" and str(v).strip():
+                        st.markdown(f"**{k}:** {v}")
+                
+                phrases = extract_search_phrases(prop)
+                if phrases:
+                    st.markdown(f"**Search phrases:** {', '.join([f'`{p}`' for p in phrases[:8]])}")
 
-        if matches:
-            st.markdown(f"### ✅ {len(matches)} match{'es' if len(matches) > 1 else ''}")
-            st.markdown('<div class="info-box">💡 Top result = most likely. All 46 DLD columns shown.</div>', unsafe_allow_html=True)
-            for i, m in enumerate(matches[:10], 1):
-                render_card(m, i)
-        else:
-            st.warning("⚠️ No matches. Property may be off-plan or named differently in DLD.")
+            with st.spinner("🔍 Searching DLD database..."):
+                matches = find_units(conn, prop)
+
+            if matches:
+                st.markdown(f"### ✅ {len(matches)} match{'es' if len(matches) > 1 else ''}")
+                st.markdown('<div class="info-box">💡 Top result = most likely. All 46 DLD columns shown.</div>', unsafe_allow_html=True)
+                for i, m in enumerate(matches[:10], 1):
+                    render_card(m, i)
+            else:
+                st.warning("⚠️ No matches found. Try **Manual Search** tab — search by project name directly.")
+
+    # ============= TAB 2: MANUAL SEARCH =============
+    with tab2:
+        st.markdown("Search the DLD database directly by project name, area, unit number, etc.")
+        
+        col_a, col_b = st.columns([3, 1])
+        with col_a:
+            query = st.text_input("🔍 Search term", placeholder="e.g. Farm Gardens, Greenway, Emaar South...")
+        with col_b:
+            field = st.selectbox("Search in", [
+                "Project Name", "Master Project", "Area Name",
+                "Unit Number", "Building", "Property ID"
+            ])
+        
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            btn2 = st.button("🔍 Search DLD", use_container_width=True, type="primary", key="manual_search")
+        
+        if btn2 and query:
+            if not conn:
+                st.error("❌ No database. Click **🔄 Update Now** in sidebar.")
+                return
+            
+            with st.spinner("🔍 Searching..."):
+                results = manual_search(conn, query, field)
+            
+            if results:
+                st.markdown(f"### ✅ {len(results)} result{'s' if len(results) > 1 else ''} for `{query}` in {field}")
+                for i, m in enumerate(results[:20], 1):
+                    m["_match_score"] = 100  # manual search = high confidence
+                    render_card(m, i)
+            else:
+                st.warning(f"⚠️ No results for `{query}` in {field}. Try a different search term or field.")
 
     st.markdown("---")
     st.markdown('<p style="text-align:center;color:#888;font-size:0.8rem;">DLD Open Data • 46 columns preserved • Personal use</p>', unsafe_allow_html=True)
