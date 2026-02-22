@@ -172,20 +172,52 @@ def get_db_stats():
         return None
 
 
-# ===================== SCRAPER =====================
+# ===================== URL PARSER + SCRAPER =====================
 
-def scrape_property_finder(url: str) -> dict:
+def parse_pf_url(url: str) -> dict:
     """
-    Scrape Property Finder listing page.
-    Uses a session with full browser headers to avoid blocks.
-    Extracts: title, bedrooms, area, location, zone name, breadcrumbs, etc.
-    """
+    Parse Property Finder URL — always works, no network needed.
+    URL pattern: {type}-for-{sale/rent}-dubai-{location-parts}-{listing_id}.html
     
-    # Full browser-like headers — this is key to avoid blocks
+    Example: villa-for-sale-dubai-the-valley-farm-gardens-16135129.html
+    → type=Villa, location=["the valley", "farm gardens"], id=16135129
+    """
+    data = {"source_url": url}
+    
+    slug = url.rstrip("/").split("/")[-1].replace(".html", "")
+    parts = slug.split("-")
+    
+    # Property type
+    for pt in ["villa", "apartment", "townhouse", "penthouse", "duplex", "studio"]:
+        if pt in parts:
+            data["property_type"] = pt.capitalize()
+            break
+    
+    # Listing ID (always last number)
+    if parts:
+        data["listing_id"] = parts[-1]
+    
+    # Location parts (everything between "dubai" and listing_id)
+    if "dubai" in parts:
+        idx = parts.index("dubai")
+        loc_parts = parts[idx + 1:-1]  # exclude listing id
+        if loc_parts:
+            data["url_location"] = " ".join(loc_parts)
+    
+    return data
+
+
+def try_scrape_pf(url: str) -> dict:
+    """
+    Try to scrape Property Finder page for extra details.
+    May fail from cloud servers (PF blocks bots). That's OK — URL parsing is enough.
+    """
+    extra = {}
+    
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
@@ -194,148 +226,118 @@ def scrape_property_finder(url: str) -> dict:
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "none",
         "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0",
         "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
-        "DNT": "1",
         "Referer": "https://www.google.com/",
     })
 
     try:
-        resp = session.get(url, timeout=20, allow_redirects=True)
+        resp = session.get(url, timeout=15, allow_redirects=True)
         resp.raise_for_status()
-    except requests.RequestException as e:
-        return {"error": f"Failed to fetch: {e}"}
-
-    html = resp.text
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True)
-    data = {"source_url": url, "_html_length": len(html)}
-
-    # === 1. URL parsing (always works) ===
-    slug = url.rstrip("/").split("/")[-1].replace(".html", "")
-    parts = slug.split("-")
-    for pt in ["villa", "apartment", "townhouse", "penthouse", "duplex", "studio"]:
-        if pt in parts:
-            data["property_type"] = pt.capitalize()
-            break
-    if parts:
-        data["listing_id"] = parts[-1]
-    if "dubai" in parts:
-        idx = parts.index("dubai")
-        loc = parts[idx + 1:-1]
-        if loc:
-            data["url_location"] = " ".join(loc)
-
-    # === 2. Page title / og:title ===
-    title_tag = soup.find("title")
-    if title_tag and title_tag.string:
-        raw_title = title_tag.string.strip()
-        # Remove " | Property Finder" suffix
-        raw_title = re.sub(r"\s*\|\s*Property Finder.*$", "", raw_title)
-        data["page_title"] = raw_title
-
-    for meta in soup.find_all("meta"):
-        content = meta.get("content", "").strip()
-        prop_name = (meta.get("name") or meta.get("property") or "").lower()
-        if "og:title" in prop_name and content:
-            data["og_title"] = re.sub(r"\s*\|\s*Property Finder.*$", "", content)
-
-    # === 3. H1 title ===
-    h1 = soup.find("h1")
-    if h1:
-        data["title"] = h1.get_text(strip=True)
-
-    # === 4. Breadcrumbs ===
-    # Try multiple selectors for breadcrumbs
-    crumb_links = soup.select("ol li a, nav a, [aria-label*='breadcrumb'] a")
-    crumb_texts = []
-    for link in crumb_links:
-        href = link.get("href", "")
-        txt = link.get_text(strip=True)
-        # PF breadcrumbs link to sale/rent category pages
-        if txt and ("for-sale" in href or "for-rent" in href) and len(txt) > 2:
-            crumb_texts.append(txt)
-    if crumb_texts:
-        data["breadcrumbs"] = crumb_texts
-
-    # Also look at the URL-based breadcrumb pattern from PF
-    # e.g., "Villas for sale in Dubai > The Valley > Farm Gardens > Farm Gardens 1"
-    for link in soup.find_all("a"):
-        txt = link.get_text(strip=True)
-        href = link.get("href", "")
-        if "villas-for-sale-the-valley" in href or "for-sale-the-valley" in href:
-            if txt and txt not in crumb_texts:
-                crumb_texts.append(txt)
-
-    # === 5. JSON-LD structured data ===
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            ld = json.loads(script.string)
-            items = ld if isinstance(ld, list) else [ld]
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                if "name" in item and not data.get("title"):
-                    data["name"] = item["name"]
-                if "address" in item and isinstance(item["address"], dict):
-                    data["address"] = item["address"].get("streetAddress", "")
-                    data["area"] = item["address"].get("addressLocality", "")
-                if "numberOfRooms" in item:
-                    data["bedrooms"] = int(item["numberOfRooms"])
-                if "floorSize" in item and isinstance(item["floorSize"], dict):
-                    val = item["floorSize"].get("value")
-                    if val:
-                        data["area_sqft"] = float(str(val).replace(",", ""))
-        except:
-            continue
-
-    # === 6. Extract from page text (regex fallback) ===
-    if "bedrooms" not in data:
+        html = resp.text
+        
+        # Check if we got real content (not a JS-blocked page)
+        if len(html) < 5000 or "javascript" in html.lower()[:500]:
+            extra["_scrape_status"] = "blocked"
+            return extra
+        
+        extra["_scrape_status"] = "ok"
+        extra["_html_length"] = len(html)
+        
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(" ", strip=True)
+        
+        # Title
+        h1 = soup.find("h1")
+        if h1:
+            extra["title"] = h1.get_text(strip=True)
+        
+        # og:title
+        for meta in soup.find_all("meta"):
+            content = meta.get("content", "").strip()
+            prop_name = (meta.get("name") or meta.get("property") or "").lower()
+            if "og:title" in prop_name and content:
+                extra["og_title"] = re.sub(r"\s*\|\s*Property Finder.*$", "", content)
+        
+        # Bedrooms
         m = re.search(r"(\d+)\s*(?:Bed(?:room)?s?|BR)\b", text, re.I)
         if m:
-            data["bedrooms"] = int(m.group(1))
-    
-    if "area_sqft" not in data:
-        m = re.search(r"([\d,]+(?:\.\d+)?)\s*sqft\b", text, re.I)
-        if not m:
-            m = re.search(r"([\d,]+(?:\.\d+)?)\s*sq\.?\s*ft\b", text, re.I)
+            extra["bedrooms"] = int(m.group(1))
+        
+        # Area sqft
+        m = re.search(r"([\d,]+(?:\.\d+)?)\s*(?:sqft|sq\.?\s*ft)\b", text, re.I)
         if m:
-            data["area_sqft"] = float(m.group(1).replace(",", ""))
-
-    # === 7. Zone name (from regulatory info — maps to DLD area_name!) ===
-    zone_match = re.search(r"Zone\s*name\s*[:\s]*([A-Za-z][A-Za-z\s\d]+)", text)
-    if zone_match:
-        data["dld_zone_name"] = zone_match.group(1).strip()
+            extra["area_sqft"] = float(m.group(1).replace(",", ""))
+        
+        # DLD Zone name (from regulatory info section)
+        zone_match = re.search(r"Zone\s*name\s*[:\s]*([A-Za-z][A-Za-z\s\d]+)", text)
+        if zone_match:
+            extra["dld_zone_name"] = zone_match.group(1).strip()
+        
+        # Reference number
+        ref_match = re.search(r"Reference\s*[:\s]*([A-Za-z0-9\-]+)", text)
+        if ref_match:
+            extra["reference"] = ref_match.group(1).strip()
+        
+        # Full address: "Farm Gardens 1, Farm Gardens, The Valley, Dubai"
+        addr_match = re.search(r"([\w\s]+(?:,\s*[\w\s]+){2,3},\s*Dubai)", text)
+        if addr_match:
+            extra["full_address"] = addr_match.group(1).strip()
+            addr_parts = [p.strip() for p in addr_match.group(1).split(",")]
+            if len(addr_parts) >= 3:
+                extra["sub_community"] = addr_parts[0]
+                extra["community"] = addr_parts[1]
+                extra["master_community"] = addr_parts[2]
+        
+        # Breadcrumbs
+        crumb_texts = []
+        for link in soup.find_all("a"):
+            href = link.get("href", "")
+            txt = link.get_text(strip=True)
+            if txt and ("for-sale" in href or "for-rent" in href) and len(txt) > 2:
+                if txt not in crumb_texts:
+                    crumb_texts.append(txt)
+        if crumb_texts:
+            extra["breadcrumbs"] = crumb_texts
+        
+        # JSON-LD
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                ld = json.loads(script.string)
+                items = ld if isinstance(ld, list) else [ld]
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    if "numberOfRooms" in item and "bedrooms" not in extra:
+                        extra["bedrooms"] = int(item["numberOfRooms"])
+                    if "floorSize" in item and isinstance(item["floorSize"], dict):
+                        val = item["floorSize"].get("value")
+                        if val and "area_sqft" not in extra:
+                            extra["area_sqft"] = float(str(val).replace(",", ""))
+            except:
+                continue
+    except:
+        extra["_scrape_status"] = "failed"
     
-    # Also look for DLD permit number and reference
-    ref_match = re.search(r"Reference\s*[:\s]*([A-Za-z0-9\-]+)", text)
-    if ref_match:
-        data["reference"] = ref_match.group(1).strip()
+    return extra
 
-    # === 8. Location from the address line on page ===
-    # Pattern: "Farm Gardens 1, Farm Gardens, The Valley, Dubai"
-    addr_match = re.search(r"([\w\s]+(?:,\s*[\w\s]+){2,3},\s*Dubai)", text)
-    if addr_match:
-        data["full_address"] = addr_match.group(1).strip()
-        # Parse components
-        addr_parts = [p.strip() for p in addr_match.group(1).split(",")]
-        if len(addr_parts) >= 3:
-            data["sub_community"] = addr_parts[0]  # Farm Gardens 1
-            data["community"] = addr_parts[1]       # Farm Gardens
-            data["master_community"] = addr_parts[2] # The Valley
 
-    # === 9. Property details from page ===
-    if "bedrooms" not in data:
-        bed_m = re.search(r"Bedrooms?\s*(\d+)", text, re.I)
-        if bed_m:
-            data["bedrooms"] = int(bed_m.group(1))
-
-    bath_m = re.search(r"Bathrooms?\s*(\d+)", text, re.I)
-    if bath_m:
-        data["bathrooms"] = int(bath_m.group(1))
-
+def get_property_data(url: str) -> dict:
+    """
+    Combine URL parsing (always works) + optional scraping (bonus data).
+    """
+    # 1. Parse URL (guaranteed)
+    data = parse_pf_url(url)
+    
+    # 2. Try scraping (may fail from cloud — that's OK)
+    extra = try_scrape_pf(url)
+    
+    # Merge — scrape data supplements URL data, doesn't replace it
+    for k, v in extra.items():
+        if v and (k not in data or not data[k]):
+            data[k] = v
+    
     return data
 
 
@@ -343,66 +345,62 @@ def scrape_property_finder(url: str) -> dict:
 
 def extract_search_phrases(prop: dict) -> list:
     """
-    Extract meaningful search phrases from scraped data.
-    Returns list of phrases ordered by specificity (most specific first).
+    Extract meaningful search phrases from property data.
+    Works with URL-only data OR full scraped data.
+    
+    Key: PF URL "the-valley-farm-gardens" needs smart splitting into
+    master_project="The Valley" + project="Farm Gardens"
     """
     phrases = []
+    MIN_LEN = 4  # Skip short garbage like "the"
     
-    # 1. Sub-community / community / master from page address (MOST SPECIFIC)
-    # e.g., "Farm Gardens 1" / "Farm Gardens" / "The Valley"
-    sub = prop.get("sub_community", "")
-    comm = prop.get("community", "")
-    master = prop.get("master_community", "")
-    if sub:
-        phrases.append(sub)
-    if comm and comm != sub:
-        phrases.append(comm)
-    if master and master != comm:
-        phrases.append(master)
+    # 1. Scraped community data (best if available)
+    for key in ["sub_community", "community", "master_community", "dld_zone_name"]:
+        val = prop.get(key, "")
+        if val and len(val) >= MIN_LEN:
+            phrases.append(val)
     
-    # 2. DLD Zone name (from regulatory info — maps to DLD area_name!)
-    zone = prop.get("dld_zone_name", "")
-    if zone:
-        phrases.append(zone)
-    
-    # 3. Title/name from page
-    title = prop.get("title") or prop.get("og_title") or prop.get("name", "")
-    if title:
-        stop = {"for","sale","rent","in","at","a","an","bed","bedroom","bedrooms",
-                "bathroom","bathrooms","with","and","buy","aed","sqft","sq","ft",
-                "br","-","of","on","by","to","from","dubai","uae","property",
-                "elegant","luxury","luxurious","beautiful","stunning","spacious",
-                "brand","new","modern","exclusive","premium","amazing","gorgeous"}
-        words = [w for w in re.split(r"[\s,\-/|]+", title) if w.lower() not in stop and len(w) > 1]
-        if words:
-            phrases.append(" ".join(words))
-    
-    # 4. URL location
+    # 2. URL location — main data source when scraping fails
     url_loc = prop.get("url_location", "")
-    if url_loc:
+    if url_loc and len(url_loc) >= MIN_LEN:
         phrases.append(url_loc)
+        # Try all split points: "the valley farm gardens" →
+        #   right="farm gardens" left="the valley"  ← correct!
+        #   right="valley farm gardens" left="the"   ← "the" filtered by MIN_LEN
         parts = url_loc.split()
         if len(parts) >= 2:
             for split_at in range(1, len(parts)):
                 left = " ".join(parts[:split_at])
                 right = " ".join(parts[split_at:])
-                if len(right) > 2:
+                if len(right) >= MIN_LEN:
                     phrases.append(right)
-                if len(left) > 2:
+                if len(left) >= MIN_LEN:
                     phrases.append(left)
     
-    # 5. Breadcrumbs
+    # 3. Page title (skip garbage like "JavaScript is disabled")
+    title = prop.get("title") or prop.get("og_title", "")
+    if title and "javascript" not in title.lower() and len(title) > 10:
+        stop = {"for","sale","rent","in","at","a","an","bed","bedroom","bedrooms",
+                "bathroom","bathrooms","with","and","buy","aed","sqft","sq","ft",
+                "br","of","on","by","to","from","dubai","uae","property",
+                "elegant","luxury","luxurious","beautiful","stunning","spacious",
+                "brand","new","modern","exclusive","premium","amazing","gorgeous"}
+        words = [w for w in re.split(r"[\s,\-/|]+", title) if w.lower() not in stop and len(w) > 2]
+        if len(words) >= 2:
+            phrases.append(" ".join(words))
+    
+    # 4. Breadcrumbs
     for crumb in prop.get("breadcrumbs", []):
         c = crumb.strip()
-        if c.lower() not in ("dubai", "home", "buy", "rent", "properties", "uae") and len(c) > 2:
+        if len(c) >= MIN_LEN and c.lower() not in ("dubai", "home", "buy", "rent", "properties", "uae"):
             phrases.append(c)
     
-    # Deduplicate
+    # Deduplicate, enforce MIN_LEN
     seen = set()
     unique = []
     for p in phrases:
         p_lower = p.strip().lower()
-        if p_lower and p_lower not in seen:
+        if p_lower and p_lower not in seen and len(p_lower) >= MIN_LEN:
             seen.add(p_lower)
             unique.append(p_lower)
     
@@ -736,26 +734,30 @@ def main():
             st.error("❌ No database. Click **🔄 Update Now** in sidebar.")
             return
 
-        with st.spinner("🌐 Scraping Property Finder..."):
-            prop = scrape_property_finder(url)
+        with st.spinner("🔍 Analyzing property link..."):
+            prop = get_property_data(url)
         if "error" in prop:
             st.error(f"❌ {prop['error']}")
             return
+        
+        scrape_status = prop.get("_scrape_status", "not attempted")
+        scrape_note = ""
+        if scrape_status == "blocked":
+            scrape_note = " *(scraping blocked by PF — using URL data only)*"
+        elif scrape_status == "failed":
+            scrape_note = " *(scraping failed — using URL data only)*"
 
-        st.markdown("### 📋 Scraped Details")
+        st.markdown(f"### 📋 Property Details{scrape_note}")
         with st.expander("View", expanded=True):
             for k, v in {
-                "Title": prop.get("title") or prop.get("og_title") or prop.get("name", "—"),
+                "Title": prop.get("title") or prop.get("og_title", "—"),
                 "Type": prop.get("property_type", "—"),
                 "Bedrooms": prop.get("bedrooms", "—"),
-                "Bathrooms": prop.get("bathrooms", "—"),
                 "Area (sqft)": prop.get("area_sqft", "—"),
-                "Address": prop.get("full_address") or prop.get("url_location", "—"),
+                "URL Location": prop.get("url_location", "—"),
                 "Community": prop.get("community", "—"),
                 "Master Community": prop.get("master_community", "—"),
-                "DLD Zone Name": prop.get("dld_zone_name", "—"),
-                "Reference": prop.get("reference", "—"),
-                "HTML size": f"{prop.get('_html_length', 0):,} chars",
+                "DLD Zone": prop.get("dld_zone_name", "—"),
             }.items():
                 st.markdown(f"**{k}:** {v}")
             
